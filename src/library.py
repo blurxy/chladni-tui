@@ -53,6 +53,44 @@ def save_library(d):
     os.replace(tmp, LIB)
 
 
+def ensure_meta():
+    """Fetch the surah and reciter catalogues if they are not here yet.
+
+    These are deliberately NOT in the repository -- they are third-party data,
+    and this project ships the client rather than the content. But that means a
+    fresh clone has no meta/ at all, and the first command a new user runs is a
+    search. Fetch on demand instead of crashing with a traceback about a missing
+    file the README never mentions.
+    """
+    os.makedirs(META, exist_ok=True)
+    need = [f for f in ("surahs.json", "reciters.json", "ayah_counts.json")
+            if not os.path.exists(os.path.join(META, f))]
+    if not need:
+        return
+    sys.stderr.write("fetching surah and reciter catalogues (first run)...\n")
+    try:
+        data = json.loads(_get("%s/surah" % QURAN_API))["data"]
+        surahs = [{"no": x["number"], "name": x["englishName"],
+                   "meaning": x["englishNameTranslation"],
+                   "revelation": x["revelationType"], "ayat": x["numberOfAyahs"]}
+                  for x in data]
+        rec_raw = json.loads(_get("%s/recitations.js" % EVERYAYAH))
+        recs = sorted(({"id": v["subfolder"], "name": v["name"], "bitrate": v["bitrate"]}
+                       for k, v in rec_raw.items() if k != "ayahCount"),
+                      key=lambda r: (r["name"], r["bitrate"]))
+        with open(os.path.join(META, "surahs.json"), "w", encoding="utf-8") as fh:
+            json.dump(surahs, fh, indent=0)
+        with open(os.path.join(META, "reciters.json"), "w", encoding="utf-8") as fh:
+            json.dump(recs, fh, indent=0)
+        with open(os.path.join(META, "ayah_counts.json"), "w", encoding="utf-8") as fh:
+            json.dump(rec_raw["ayahCount"], fh)
+        sys.stderr.write("  %d surahs, %d reciters\n" % (len(surahs), len(recs)))
+    except (urllib.error.URLError, ValueError, KeyError, OSError) as e:
+        raise SystemExit(
+            "could not fetch the catalogues (%s).\n"
+            "They come from alquran.cloud and everyayah.com -- check your network." % e)
+
+
 def _json(path):
     with open(os.path.join(META, path), encoding="utf-8") as fh:
         return json.load(fh)
@@ -636,9 +674,13 @@ def main():
     p.add_argument("--url"); p.add_argument("--title")
     sub.add_parser("list", help="what is in the library")
     p = sub.add_parser("remove", help="drop a track"); p.add_argument("id")
+    sub.add_parser("sync", help="refresh the surah/reciter catalogues")
     sub.add_parser("build", help="re-order and write the timeline")
     sub.add_parser("migrate", help="adopt pre-library audio")
     a = ap.parse_args()
+
+    if a.cmd in ("search", "reciters", "add", "migrate"):
+        ensure_meta()
 
     if a.cmd == "search":
         for s in search_surahs(" ".join(a.query)):
@@ -672,6 +714,12 @@ def main():
         lib["tracks"] = keep; save_library(lib); build()
     elif a.cmd == "migrate":
         print("adopted %d existing files" % migrate_existing()); build()
+    elif a.cmd == "sync":
+        for f in ("surahs.json", "reciters.json", "ayah_counts.json"):
+            fp = os.path.join(META, f)
+            if os.path.exists(fp):
+                os.remove(fp)
+        ensure_meta()
     elif a.cmd == "build":
         build()
     else:
