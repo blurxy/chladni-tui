@@ -1132,6 +1132,8 @@ def main():
     ap.add_argument("--seconds", type=float, default=0.0)
     ap.add_argument("--start", type=float, default=0.0, help="seconds into the timeline")
     ap.add_argument("--no-chrome", action="store_true")
+    ap.add_argument("--anonymise", "--anonymize", dest="anon", action="store_true",
+                    help="redact machine identifiers, for screenshots")
     ap.add_argument("--dump", action="store_true", help="settle, print one frame, exit")
     ap.add_argument("--aspect", type=float, default=0.0, help="override sub-dot h/w")
     ap.add_argument("--rim", type=float, default=0.17, help="how hard the clamped rim is swept")
@@ -1163,6 +1165,12 @@ def main():
     chrome = Chrome(cols, rows)
     scr.set_underlay(plate_ring(bank, subw, subh), C["rule"])
     info = sysinfo()
+    if args.anon:
+        # The panel prints the hostname, and on a single-user box that is the
+        # username. Screenshots outlive the terminal they were taken in.
+        info["host"] = "localhost"
+        info["kernel"] = info["kernel"].split("-")[0] if info["kernel"] else ""
+
 
     sel = (FigurePlayer(nm, args.fps) if tl.get("fig") is not None
            else FigureSelector(nm, args.fps))
