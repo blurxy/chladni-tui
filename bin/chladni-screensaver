@@ -1,0 +1,117 @@
+#!/bin/bash
+
+# omarchy:summary=Run the Chladni sand-plate screensaver.
+#
+# Mirrors Omarchy's screensaver contract: same window class, same exit on any
+# keypress or loss of focus, same cursor handling, same wait for the pty to be
+# resized off its initial 80x24. Only the renderer differs.
+
+RENDERER="$HOME/.local/share/chladni-tui/cyscreen.py"
+PYTHON="$HOME/.local/share/chladni-tui/.venv/bin/python"
+
+# Only police focus when we actually ARE the screensaver window. Run by hand in
+# a normal terminal the class never matches, so the check would fire on the
+# first tick and quit before a single frame was drawn.
+if hyprctl activewindow -j 2>/dev/null | jq -e '.class == "org.omarchy.screensaver"' >/dev/null 2>&1; then
+  guard_focus=1
+else
+  guard_focus=0
+fi
+
+screensaver_in_focus() {
+  ((guard_focus)) || return 0
+  hyprctl activewindow -j | jq -e '.class == "org.omarchy.screensaver"' >/dev/null 2>&1
+}
+
+cleaned=0
+hid_cursor=0
+
+restore_cursor() {
+  # Only undo what we actually did. Note hyprctl keyword is dead on this
+  # Hyprland ("can't work with non-legacy parsers, use eval"), so eval is not a
+  # fallback here -- it is the only path that works.
+  ((hid_cursor)) || return 0
+  hyprctl eval 'hl.config({ cursor = { invisible = false } })' &>/dev/null || true
+  hid_cursor=0
+}
+
+exit_screensaver() {
+  ((cleaned)) && exit 0
+  cleaned=1
+  restore_cursor
+  # A bare kill is not enough: numpy spends most of each frame inside C code, so
+  # the signal is not acted on until it returns, and a wrapper that exits first
+  # leaves the renderer orphaned and still drawing. Escalate, and wait.
+  if [[ -n $render_pid ]]; then
+    kill -TERM "$render_pid" 2>/dev/null
+    for _ in $(seq 1 20); do
+      kill -0 "$render_pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    kill -KILL "$render_pid" 2>/dev/null
+    wait "$render_pid" 2>/dev/null
+  fi
+  ((guard_focus)) && pkill -f '[o]rg.omarchy.screensaver' 2>/dev/null
+  exit 0
+}
+
+# EXIT as well as the signals: if the renderer dies, the terminal closes, or the
+# script ends any way other than a trapped signal, the pointer must still come
+# back. Leaving the mouse invisible system-wide is not a recoverable state for
+# someone who just wanted to look at a screensaver.
+trap exit_screensaver SIGINT SIGTERM SIGHUP SIGQUIT EXIT
+
+if [[ ! -x $PYTHON || ! -f $RENDERER ]]; then
+  # Say what is wrong rather than leave a black screen to guess at. Fall through
+  # to a stock screensaver only if this machine actually has one.
+  echo "chladni-tui is not installed at $RENDERER -- run ./install.sh" >&2
+  command -v omarchy-screensaver >/dev/null && exec omarchy-screensaver
+  exit 1
+fi
+
+printf '\033]11;rgb:15/1a/1f\007'
+
+# Hide the pointer only when this really IS the screensaver. Run by hand in a
+# normal terminal it would hide the mouse for the whole session -- and the user
+# still has a desktop to use behind it.
+if ((guard_focus)); then
+  if hyprctl eval 'hl.config({ cursor = { invisible = true } })' &>/dev/null; then
+    hid_cursor=1
+  fi
+fi
+
+tty=$(tty 2>/dev/null)
+
+# The terminal allocates the pty at 80x24 and only resizes once the compositor
+# has told the window how big it is. Measuring before that lands sizes the
+# canvas to a corner of a fullscreen window.
+wait_for_terminal_resize() {
+  local deadline=$((SECONDS + 2))
+  while ((SECONDS < deadline)) && [[ $(stty size 2>/dev/null) == "24 80" ]]; do
+    sleep 0.02
+  done
+}
+
+wait_for_terminal_resize
+
+while true; do
+  "$PYTHON" "$RENDERER" "$@" &
+  render_pid=$!
+
+  while kill -0 "$render_pid" 2>/dev/null; do
+    if [[ -t 0 ]]; then
+      # A keypress ends it. read blocks for up to a second, so this loop costs
+      # nothing while idle.
+      if read -r -n1 -t 1 || ! screensaver_in_focus; then
+        exit_screensaver
+      fi
+    else
+      # stdin is not a live terminal (piped, closed, or detached). read would
+      # then fail INSTANTLY rather than waiting its timeout, turning this into a
+      # busy loop that pegs a core and makes the whole desktop feel like it has
+      # stopped responding to the mouse and keyboard. Wait properly instead.
+      sleep 1
+      screensaver_in_focus || exit_screensaver
+    fi
+  done
+done

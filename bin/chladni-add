@@ -1,0 +1,76 @@
+#!/bin/bash
+# omarchy:summary=Add surahs or any audio to the Chladni screensaver.
+#
+# Search is fzf: start typing and it filters live. Reciters are a multi-select
+# (tab to mark, enter to confirm). Anything added is downloaded, analysed into a
+# mode timeline, and the play order is rebuilt so the same surah never runs twice
+# in a row.
+
+set -o pipefail
+PY="$HOME/.local/share/chladni-tui/.venv/bin/python"
+LIB="$HOME/.local/share/chladni-tui/library.py"
+export OMP_NUM_THREADS=4
+
+die() { echo "$1" >&2; exit 1; }
+[[ -x $PY && -f $LIB ]] || die "chladni-tui library not installed"
+command -v fzf >/dev/null || die "fzf is required"
+
+pick_surah() {
+  "$PY" "$LIB" search | fzf --prompt='surah  ' --height=80% --border=rounded \
+    --header=$'type to search: name, meaning, or number   ·   enter to choose' \
+    --info=inline --pointer='>' --color='border:8,header:6,pointer:3' \
+    | awk '{print $1}'
+}
+
+pick_reciters() {
+  "$PY" "$LIB" reciters | fzf --multi --prompt='reciters  ' --height=80% --border=rounded \
+    --header=$'tab to mark one or more   ·   enter to confirm' \
+    --info=inline --pointer='>' --marker='+' --color='border:8,header:6,pointer:3,marker:2' \
+    | awk '{print $1}'
+}
+
+add_surah() {
+  local n; n=$(pick_surah); [[ -n $n ]] || return 0
+  local recs; recs=$(pick_reciters); [[ -n $recs ]] || return 0
+  local args=()
+  while read -r r; do [[ -n $r ]] && args+=(--reciter "$r"); done <<<"$recs"
+  "$PY" "$LIB" add --surah "$n" "${args[@]}"
+}
+
+add_link() {
+  local url
+  if command -v gum >/dev/null; then
+    url=$(gum input --placeholder "paste a link, or a path to an audio file")
+  else
+    read -rp "link or file path: " url
+  fi
+  [[ -n $url ]] || return 0
+  "$PY" "$LIB" add --url "$url"
+}
+
+menu() {
+  if command -v gum >/dev/null; then
+    gum choose --header="chladni-tui" \
+      "add a surah" "paste a link or file" "show what is in the library" \
+      "rebuild play order" "quit"
+  else
+    printf '1) add a surah\n2) paste a link or file\n3) show library\n4) rebuild\n5) quit\n' >&2
+    read -rp "> " a
+    case $a in 1) echo "add a surah";; 2) echo "paste a link or file";;
+               3) echo "show what is in the library";; 4) echo "rebuild play order";;
+               *) echo quit;; esac
+  fi
+}
+
+if [[ $# -gt 0 ]]; then exec "$PY" "$LIB" "$@"; fi
+
+while true; do
+  case "$(menu)" in
+    "add a surah")               add_surah ;;
+    "paste a link or file")      add_link ;;
+    "show what is in the library") "$PY" "$LIB" list ;;
+    "rebuild play order")        "$PY" "$LIB" build ;;
+    *) exit 0 ;;
+  esac
+  echo
+done

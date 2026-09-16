@@ -1,0 +1,19 @@
+# Screensaver terminal for chladni-tui (alacritty).
+#
+# Deliberately a smaller font than the stock screensaver's 18. The renderer
+# draws in braille, which packs 2x4 sub-dots into every cell, so the effective
+# resolution is (cols*2) x (rows*4) -- a smaller cell buys sub-pixels, not
+# smaller pictures. Raising this costs terminal throughput roughly as 1/size^2.
+
+[colors.primary]
+background = "0x151a1f"
+
+[colors.cursor]
+cursor = "0x151a1f"
+
+[font]
+size = 11.0
+
+[window]
+opacity = 1.0
+padding = { x = 0, y = 0 }

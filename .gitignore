@@ -1,0 +1,15 @@
+# Everything the user fetches or generates. None of it is ours to redistribute:
+# the recitations are third-party recordings, and the translations are under
+# active copyright even where the Arabic is not. Ship the client, not the content.
+audio/
+meta/
+library.json
+timeline.npz
+*.npz
+*.ogg
+*.wav
+*.mp3
+
+.venv/
+__pycache__/
+*.pyc
