@@ -111,6 +111,8 @@ recitation provides is a pitch stable long enough for sand to reach equilibrium.
 
 ![a different surah](docs/al-ikhlaas.png)
 
+![the figure at width](docs/figure.png)
+
 ## Library
 
 ```
