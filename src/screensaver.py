@@ -1332,6 +1332,13 @@ def main():
             w = (sel.update_to(tl["fig"][gi]) if tl.get("fig") is not None
                  else sel.update(amps, bank.select))
         E, GX, GY = bank.field_w(w)
+        # NO WALL CLOCK HERE, so run at the REFERENCE step. sand.dts is set from
+        # the target frame rate for the live loop; left at that value, 700 steps
+        # on a 120Hz display count as 140 reference steps and --dump prints a
+        # figure one fifth of the way to settled. The frame-rate fix silently
+        # changed this path's meaning, which is the kind of regression a flag
+        # that only runs on request is best at hiding.
+        sand.dts = 1.0
         for i in range(700):
             sand.step(E, GX, GY, 0.85 if i < 60 else 0.30)
         scr.set_field_bg(E, bank)
