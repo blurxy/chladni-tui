@@ -274,9 +274,17 @@ A Nerd Font with braille coverage — built against Iosevka.
 Resizes live from a 60×16 terminal to fullscreen. Any key exits.
 `--silent` for no audio, `--anonymise` to redact machine identifiers in screenshots.
 
-`src/rasterize.py` draws the program's own escape-sequence output to a PNG using
-the real font and cell metrics — which is how every screenshot here was taken,
-without a screen.
+`tools/render-dump.py` runs the renderer inside a pseudo-terminal of a size you
+choose and draws its output to a PNG — same font, same cell metrics, no window
+and no compositor, so two frames meant to be compared come back the same size.
+It refuses to write a frame holding fewer than 200 braille cells, because its
+first run rendered an argparse error to a clean-looking PNG and reported
+success. Every screenshot here was taken with it.
+
+`tools/layout-check.py` draws every verse in the library across seven terminal
+sizes and asserts the layout does not move: the ayah header lands on the same
+row whatever is playing, the plate never reaches it, nothing writes into the
+bottom strip.
 
 ## License
 
