@@ -13,7 +13,8 @@ Energy is the INCOHERENT sum  E = sum_i a_i^2 * U_i^2, not (sum a_i U_i)^2.
 The modes sit at incommensurate frequencies, so squaring a coherent sum would
 invent interference nodes no real plate has.
 """
-import os, random, sys, time, math, signal, argparse, json, glob, struct, fcntl, termios
+import os
+import random, sys, time, math, signal, argparse, json, glob, struct, fcntl, termios
 import shutil, subprocess
 
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
@@ -34,10 +35,17 @@ GROUND = (0x15, 0x1a, 0x1f)
 # -> gold -> warm white, so the halo around every nodal line resolves as colour
 # instead of five shades of the background. Measured before this change, the two
 # commonest colours in a frame were the background and the panel rule.
-SAND_STOPS = [(0.00, (0x15, 0x1a, 0x1f)), (0.10, (0x17, 0x28, 0x3c)),
-              (0.24, (0x1d, 0x4a, 0x6b)), (0.40, (0x27, 0x87, 0x9b)),
-              (0.55, (0x4f, 0xb6, 0xb0)), (0.70, (0xd2, 0xa1, 0x4a)),
-              (0.86, (0xf2, 0xcb, 0x7d)), (1.00, (0xfd, 0xf6, 0xe8))]
+# THE RAMP WAS NEVER THE PROBLEM; NOTHING REACHED IT. Measured from a real
+# frame: the plate rendered almost entirely in the two darkest stops, with the
+# warm end unused, because a settled nodal line's density sits near the middle
+# of the normalised range and the stops put colour in the top third. Pulling the
+# warm stops down means a line that has actually settled reads as gold instead
+# of as the second-darkest blue -- which is the whole point of a ramp.
+SAND_STOPS = [(0.00, (0x15, 0x1a, 0x1f)), (0.06, (0x1b, 0x33, 0x4e)),
+              (0.14, (0x22, 0x5c, 0x85)), (0.24, (0x2b, 0x96, 0xae)),
+              (0.36, (0x58, 0xc9, 0xc2)), (0.50, (0x9a, 0xdc, 0x9b)),
+              (0.64, (0xe8, 0xb5, 0x55)), (0.80, (0xf7, 0xd8, 0x8e)),
+              (1.00, (0xff, 0xf8, 0xec))]
 NLEV = 14                      # more steps now that the ramp has somewhere to go
 CHROME = {
     "rule":   (0x2b, 0x36, 0x40),
@@ -54,8 +62,17 @@ C = {k: NLEV + i for i, k in enumerate(CK)}
 # background. A very dark wash of the driving energy fills the disc without ever
 # competing with settled sand -- index 0 is the terminal's own background, so a
 # quiet cell costs 5 bytes (\033[49m), not a 19-byte truecolour escape.
-BG_STOPS = [(0.00, GROUND), (0.35, (0x18, 0x1f, 0x28)),
-            (0.70, (0x1c, 0x27, 0x34)), (1.00, (0x22, 0x31, 0x42))]
+# THE PLATE BODY READ AS NEAR-BLACK. This wash is the vibrating membrane where
+# no sand has settled -- most of the disc, most of the time -- and it topped out
+# at #223142, about 6% off the background. So the picture was a bright figure on
+# a void rather than sand on a plate, and the disc's edge was invisible except
+# where the ring was drawn. Raised and warmed toward the sand ramp's blue so the
+# membrane reads as a lit surface, while still sitting clearly BELOW the lowest
+# sand level -- a quiet cell must never compete with a settled one, which is the
+# constraint that kept this dark in the first place.
+BG_STOPS = [(0.00, GROUND), (0.30, (0x1c, 0x26, 0x33)),
+            (0.60, (0x24, 0x35, 0x49)), (0.85, (0x2c, 0x44, 0x5f)),
+            (1.00, (0x35, 0x53, 0x72))]
 NBG = 5
 BG0 = NLEV + len(CK)
 
@@ -351,7 +368,17 @@ class Sand:
 
     EDGE = np.float32(0.972)
 
-    def __init__(self, n, subw, subh, bank, seed=11):
+    # PHYSICS IS DEFINED AT 24 STEPS PER SECOND AND RESCALED FOR ANY OTHER RATE.
+    # Raising --fps without this does not make the same picture smoother, it makes
+    # a DIFFERENT picture: the integrator takes five times as many steps per second
+    # of audio, so the sand travels five times as far. Measured at --fps 120 before
+    # this existed -- "settled" fell from 99% to 69% and figure-hold from 1.7s to
+    # 0.2s, i.e. the plate stopped converging at all. Diffusion scales with
+    # sqrt(dt) because a random walk's spread goes as the square root of step
+    # count; drift and transport scale with dt because they are velocities.
+    REF_FPS = 24.0
+
+    def __init__(self, n, subw, subh, bank, seed=11, fps=REF_FPS):
         self.rng = np.random.default_rng(seed)
         self.subw, self.subh, self.n = subw, subh, n
         self.bank = bank
@@ -360,23 +387,30 @@ class Sand:
         self.py = self.rng.uniform(0, bank.ph - 1, n).astype(np.float32)
         self.sweep_in()
 
-    def step(self, E, GX, GY, agit, drift=2.1, floor=0.050, transport=np.float32(1.4)):
+    def step(self, E, GX, GY, agit, drift=3.2, floor=0.044, transport=np.float32(2.0)):
+        # drift and transport RAISED with the faster figure schedule. Grains that
+        # need ~3s to reach a nodal line cannot express a figure that changes every
+        # 0.9s -- the plate just reads as permanent blur, which is a worse desync
+        # than the lock it replaced. Floor lowered slightly so settled lines stay
+        # settled rather than being re-agitated out of the figure they just made.
         b = self.bank
         xi = self.px.astype(np.int32); yi = self.py.astype(np.int32)
         np.clip(xi, 0, b.pw - 1, out=xi); np.clip(yi, 0, b.ph - 1, out=yi)
         flat = yi * b.pw + xi
         e = E[flat]
         self.settled = float((e < 0.02).mean())
-        step = (np.sqrt(np.maximum(e, 0.0)) * agit + floor).astype(np.float32)
-        dx = (-drift * GX[flat]).astype(np.float32)
-        dy = (-drift * GY[flat]).astype(np.float32)
+        dts = getattr(self, 'dts', 1.0)
+        sq = np.float32(math.sqrt(dts))
+        step = ((np.sqrt(np.maximum(e, 0.0)) * agit + floor) * sq).astype(np.float32)
+        dx = (-drift * dts * GX[flat]).astype(np.float32)
+        dy = (-drift * dts * GY[flat]).astype(np.float32)
         # Clamp drift by MAGNITUDE: clamping each component separately lets a
         # diagonal step run sqrt(2) longer than a cardinal one, which parks
         # grains in four bright blobs at the compass points. The constant
         # transport term is what lets a grain cross the plate at all -- a pure
         # step*k clamp ties travel speed to agitation, so a calm field never
         # finishes converging.
-        lim = step * np.float32(2.5) + transport
+        lim = step * np.float32(2.5) + transport * np.float32(dts)
         mag = np.hypot(dx, dy)
         np.maximum(mag, np.float32(1e-12), out=mag)
         sc = np.minimum(lim / mag, np.float32(1.0))
@@ -952,20 +986,45 @@ def draw(chrome, st):
     # It was in the left column at ~30 columns wide, where ayah 7 (95 characters
     # of translation) wrapped past its allotted lines and got an ellipsis. The
     # words are the reason any of this is on screen; give them the whole width.
+    # LAID OUT ON A SPACING SCALE, FROM THE BOTTOM UP, AND MEASURED FROM THE
+    # CONTENT RATHER THAN ASSUMED.
+    #
+    # Two defects this replaces, both visible on screen and both caused by
+    # hardcoding row offsets that the content does not respect:
+    #
+    #   * The translation was pinned to ay+3 while the transliteration began at
+    #     ay+1 and could take two lines. So the gap between them was ONE row for
+    #     a short ayah and ZERO for a long one -- the vertical rhythm changed
+    #     depending on which verse was playing, which reads as the whole block
+    #     jittering as the recitation moves.
+    #   * A two-line translation reached ay+4, and ay+4 == rows-4 == the row the
+    #     bottom rule is drawn on, so the last line of the longest verses was
+    #     overwritten by a horizontal line.
+    #
+    # The fix is the standard one for this: pick a unit, derive every gap from
+    # it, and lay out against measured block heights instead of guesses. GAP=1
+    # between a label and what it labels, GAP*2 between distinct groups -- the
+    # proximity rule, where distance encodes relatedness.
     tl_, tr_ = st["ayah_text"]
-    ay = rows - 8
-    if tl_ and ay > 4:
-        hdr = "\u0660%d : %d\u0661   of %d   \u00b7   %s   \u00b7   %s" % (
+    GAP = 1
+    wide = min(cols - 8, 150)
+    tl_lines = [l for l in wrap(tl_, wide, 2) if l] if tl_ else []
+    tr_lines = [l for l in wrap(tr_, wide, 2) if l] if tr_ else []
+    # header + gap + translit + gap*2 + translation, sitting directly above the rule
+    block = 1 + GAP + len(tl_lines) + (GAP * 2 + len(tr_lines) if tr_lines else 0)
+    ay = (rows - 4) - block - 1          # one clear row above the rule, always
+    if tl_lines and ay > 4:
+        hdr = "%d : %d   of %d   \u00b7   %s   \u00b7   %s" % (
             st["surah_no"], st["ayah"], st["n_ayat"], st["surah"], st["revelation"])
-        hdr = hdr.replace("\u0660", "").replace("\u0661", "")
         ch.put(ay, max(2, (cols - len(hdr)) // 2), hdr, D)
-        wide = min(cols - 8, 150)
-        for i, ln in enumerate(wrap(tl_, wide, 2)):
-            if ln:
-                ch.put(ay + 1 + i, max(2, (cols - len(ln)) // 2), ln, B)
-        for i, ln in enumerate(wrap(tr_, wide, 2)):
-            if ln:
-                ch.put(ay + 3 + i, max(2, (cols - len(ln)) // 2), ln, L)
+        r = ay + 1 + GAP
+        for ln in tl_lines:
+            ch.put(r, max(2, (cols - len(ln)) // 2), ln, B)
+            r += 1
+        r += GAP * 2 - 1
+        for ln in tr_lines:
+            ch.put(r, max(2, (cols - len(ln)) // 2), ln, L)
+            r += 1
 
     # --- bottom ---------------------------------------------------------------
     br = rows - 4
@@ -1086,6 +1145,40 @@ def term_size(default=(150, 40)):
         return default
 
 
+def detect_refresh(default=60.0):
+    """The display's actual refresh rate, so animation is not pinned to 24.
+
+    A fixed 24 was leaving a 120Hz panel running at a fifth of what it can show.
+    The physics is rescaled against Sand.REF_FPS, so raising this changes only
+    how smooth the motion is -- not how the sand behaves.
+
+    Asks the compositor first; falls back to DRM sysfs, then to `default`. Never
+    raises: a screensaver that refuses to start because it could not identify the
+    monitor is worse than one running at 60.
+    """
+    try:
+        r = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True,
+                           text=True, timeout=3)
+        if r.returncode == 0:
+            best = max((float(m.get("refreshRate") or 0)
+                        for m in json.loads(r.stdout)), default=0.0)
+            if 20.0 <= best <= 480.0:
+                return best
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        for d in glob.glob("/sys/class/drm/card*/modes"):
+            with open(d) as fh:
+                head = fh.readline().strip()
+            if "@" in head:
+                hz = float(head.split("@")[1].rstrip("iA-Za-z"))
+                if 20.0 <= hz <= 480.0:
+                    return hz
+    except (OSError, ValueError, IndexError):
+        pass
+    return default
+
+
 def load_timeline(path):
     if not os.path.exists(path):
         return None
@@ -1126,7 +1219,8 @@ def synth_timeline(nm, fps=24.0, secs=90.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--fps", type=float, default=24.0)
+    ap.add_argument("--fps", type=float, default=0.0,
+                    help="target frame rate (default: the monitor's refresh rate)")
     ap.add_argument("--grains", type=int, default=0)
     ap.add_argument("--size", default="")
     ap.add_argument("--seconds", type=float, default=0.0)
@@ -1143,6 +1237,8 @@ def main():
     ap.add_argument("--silent", action="store_true", help="do not play the recitation")
     ap.add_argument("--gap", type=float, default=2.5, help="seconds of quiet between reciters")
     args = ap.parse_args()
+    if args.fps <= 0:
+        args.fps = detect_refresh()
 
     if args.size:
         cols, rows = (int(v) for v in args.size.lower().split("x"))
@@ -1161,7 +1257,10 @@ def main():
     bank = ModeBank(tl["mn"], subw, subh, rim_strength=args.rim,
                     select=args.select, **plate_fit(cols, rows))
     ngrain = args.grains or int(np.clip(subw * subh * 0.55, 45000, 300000))
-    sand = Sand(ngrain, subw, subh, bank)
+    sand = Sand(ngrain, subw, subh, bank, fps=args.fps)
+    sand.dts = Sand.REF_FPS / max(args.fps, 1.0)
+    _last_step_t = 0.0
+    info["fps_target"] = args.fps
     gain = 1.0 / max(3.0, ngrain / float(cols * rows) * 4.5)
     chrome = Chrome(cols, rows)
     scr.set_underlay(plate_ring(bank, subw, subh), C["rule"])
@@ -1176,18 +1275,18 @@ def main():
     sel = (FigurePlayer(nm, args.fps) if tl.get("fig") is not None
            else FigureSelector(nm, args.fps))
     fps_meas = args.fps
+    pending_size, pending_at = (0, 0), 0.0
     offs = tl["offsets"]; total = int(offs[-1])
     if args.start is None:
         # START ON A RANDOM TRACK, not at zero. A screensaver is not an album:
-        # it runs for a few minutes and is killed by a keypress, so a fixed start
-        # means only the first track or two is ever seen. Measured on a 38-track,
-        # 118-minute library: starting at 0 every time made everything past
-        # position 3 unreachable in practice, including every long recitation,
-        # because the ordering drains multi-recording surahs first and strands
-        # single-recording ones at the end.
+        # it runs for a few minutes and is killed by a keypress, so a fixed
+        # start means only the first track or two is ever seen. With a 55 min
+        # playlist and Ya-Sin sitting at position 16, starting at 0 every time
+        # meant the long recitations were unreachable in practice.
         #
         # Snap to a track BOUNDARY rather than a random second, so a session
-        # always opens on the first ayah of something rather than mid-word.
+        # always opens on the first ayah of something rather than halfway
+        # through a word.
         starts = [int(o) for o in offs[:-1]] or [0]
         gi = starts[random.randrange(len(starts))]
     else:
@@ -1321,7 +1420,24 @@ def main():
             lv_drive = float(tl["lvl"][gi % total])
             # The figure changes on a multi-second schedule, so this is the
             # only channel that answers the voice instantly. Give it real range.
-            agit = 0.12 + 0.55 * float(np.clip(lv_drive, 0.0, 1.6))
+            # COEFFICIENT RESCALED WITH THE FIX ABOVE. Once lvl stopped
+            # saturating, its median fell from 1.599 to 0.768 -- so the old
+            # 0.55 slope, tuned against a signal pinned at its ceiling, halved
+            # the plate's total energy and would have traded a frozen plate for
+            # a limp one. Slope raised to put the median back where it was while
+            # keeping the swing the fix bought (1.55x -> ~2.2x).
+            agit = 0.10 + 1.05 * float(np.clip(lv_drive, 0.0, 1.6))
+            # dt FROM THE CLOCK, NOT FROM THE FLAG. Setting this once from
+            # --fps was correct about the number it was given and silent about
+            # what the machine did: asked for 120 the renderer sustains ~67, so
+            # a startup-computed dts of 24/120=0.20 ran the physics at 55% of
+            # real speed and figures took twice as long to form. Measuring the
+            # actual frame interval makes the sand behave identically whether
+            # the machine hits its target, misses it, or is interrupted.
+            _tn = time.time()
+            _dt = _tn - _last_step_t if _last_step_t else (1.0 / max(args.fps, 1.0))
+            _last_step_t = _tn
+            sand.dts = float(np.clip(_dt * Sand.REF_FPS, 0.10, 2.0))
             sand.step(E, GX, GY, agit)
             ch, lvv, bgv = scr.compose(sand, gain)
             if not args.no_chrome:
@@ -1343,10 +1459,32 @@ def main():
             # at all if the size changed before the handler was installed) that
             # relying on it alone is how the window ends up rendering at its
             # startup size forever, which is exactly what fullscreen did.
-            if RUN["resized"] or frame % 24 == 0:
+            if RUN["resized"] or frame % 6 == 0:
                 RUN["resized"] = False
                 nc, nr = term_size((cols, rows))
+                # DEBOUNCE. A compositor ANIMATES a fullscreen toggle, so one
+                # super+F emits a whole sequence of intermediate sizes. Rebuilding
+                # on each one means ~20 ModeBank constructions and grain
+                # reallocations during a single keypress, each clearing the screen
+                # -- which is the glitching, not a drawing bug. Wait until the size
+                # has stopped changing before paying for a rebuild.
                 if (nc, nr) != (cols, rows):
+                    # DEBOUNCE ON TIME, NOT ON POLL COUNT. A poll count is a
+                    # different amount of real time at every frame rate -- two
+                    # polls is 0.08s at 24fps and 0.03s at 67, so the same code
+                    # debounced five times harder on a slow machine. Ctrl+scroll
+                    # zoom emits a size change per notch and a compositor
+                    # ANIMATES fullscreen, so both arrive as bursts; wait for
+                    # the burst to stop before paying for a rebuild.
+                    now_t = time.time()
+                    if (nc, nr) != pending_size:
+                        pending_size = (nc, nr)
+                        pending_at = now_t
+                        continue
+                    if now_t - pending_at < 0.22:
+                        continue
+                if (nc, nr) != (cols, rows):
+                    shrank = (nc < cols) or (nr < rows)
                     cols, rows = nc, nr
                     globals()["SUB_ASPECT"] = args.aspect if args.aspect > 0 else measure_sub_aspect()
                     scr = Screen(cols, rows)
@@ -1362,7 +1500,22 @@ def main():
                     last_fig = -2
                     scr.set_underlay(plate_ring(bank, subw, subh), C["rule"])
                     info["res"] = term_pixels() or info["res"]
-                    sys.stdout.write("\033[2J"); sys.stdout.flush()
+                    # 2J ALONE LEFT FRAGMENTS OF THE OLD LAYOUT ON SCREEN --
+                    # visible as a duplicate SYSTEM panel and stale rectangles
+                    # after the window went fullscreen. The terminal reflows on
+                    # resize, so content can land outside the viewport 2J
+                    # clears. 3J drops the scrollback too, and H parks the
+                    # cursor at origin so the first repaint starts from a known
+                    # cell rather than wherever the reflow left it.
+                    # CLEAR ONLY WHEN THE GRID SHRANK. A fresh Screen has an
+                    # empty diff buffer, so the next frame repaints every cell
+                    # anyway -- clearing as well just inserts a black flash, and
+                    # on a zoom burst that flash IS the glitching. Growing leaves
+                    # no stale cells to erase (the new ones start blank); only
+                    # shrinking can strand content outside the new grid.
+                    if shrank:
+                        sys.stdout.write("\033[3J\033[2J\033[H"); sys.stdout.flush()
+                    pending_size, pending_at = (0, 0), 0.0
                     continue
             if frame % 24 == 0:
                 stats = livestats(info)

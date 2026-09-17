@@ -345,7 +345,23 @@ def load_mono(path):
             os.remove(wav)
 
 
-def analyse(x, f0, ratio, gamma=3.0, sigma=0.030):
+def analyse(x, f0, ratio, gamma=4.5, sigma=0.055):
+    # sigma WIDENED and gamma RAISED together, because they trade against each
+    # other and changing either alone makes the other worse.
+    #
+    # sigma=0.030 is +/-3% in log-frequency -- THINNER THAN THE GAP BETWEEN
+    # ADJACENT BESSEL MODES, so a harmonic could fall between two bins and be
+    # heard by neither. That is a selector reading a spectrum through slits: what
+    # it reports depends on whether a partial happens to land on a bin centre,
+    # which is close to arbitrary and is why the figure did not follow the voice.
+    # 0.055 lets adjacent modes overlap and cross-fade, which is what the
+    # docstring below always claimed happened.
+    #
+    # Widening alone would cost crispness -- more modes lit at once. Measured
+    # before this change, purity was 0.31, i.e. the winning mode held under a
+    # third of the energy and the plate drew a blur of three figures rather than
+    # one. gamma 3.0 -> 4.5 sharpens the contrast between the leader and its
+    # neighbours after the cross-fade, restoring a single readable figure.
     """Per-frame mode amplitudes, loudness and dominant pitch.
 
     A Gaussian in LOG frequency around each mode's centre, so a voice sliding in
@@ -367,10 +383,27 @@ def analyse(x, f0, ratio, gamma=3.0, sigma=0.030):
     dt = 1.0 / FPS
     rise = 1.0 - np.exp(-dt / 0.06); fall = 1.0 - np.exp(-dt / 0.45)
     k = 1.0 - np.exp(-dt / 0.10)
+    # PER-TRACK LOUDNESS REFERENCE, measured before the loop rather than assumed.
+    #
+    # The fixed 0.035 divisor saturated. Measured across the built timeline:
+    # median lvl 1.599, p90 1.600, max 1.600 -- over half of all frames pinned at
+    # the clip ceiling, so the "loudness" channel carried no information and the
+    # plate was struck at constant force no matter what the voice did. That is
+    # the desync: not the figure being late, but the only channel that answers
+    # the voice instantly being a flat line.
+    #
+    # A recitation normalised to -14 LUFS and one mastered 12 dB quieter cannot
+    # share a constant. Reference each track to its own 90th-percentile frame
+    # RMS, so the loud passages of THIS recording land near the top of the range
+    # and the quiet ones actually read as quiet.
+    _rms = np.sqrt(np.maximum([np.mean(x[i*hop: i*hop+FFT_N]**2) for i in range(nfr)], 1e-12))
+    _ref = float(np.percentile(_rms, 90)) or 0.035
+    _ref = max(_ref, 1e-4)
+
     for i in range(nfr):
         seg = x[i * hop: i * hop + FFT_N]
         rms = float(np.sqrt(np.mean(seg * seg)))
-        lev += (float(np.clip((rms / 0.035) ** 0.5, 0.0, 1.6)) - lev) * k
+        lev += (float(np.clip((rms / _ref) ** 0.5, 0.0, 1.6)) - lev) * k
         power = np.abs(np.fft.rfft(seg * win))[lo:hi].astype(np.float32) ** 2
         tot = power.sum()
         if tot > 1e-12:
@@ -386,19 +419,61 @@ def analyse(x, f0, ratio, gamma=3.0, sigma=0.030):
     return amps, lvl, hz
 
 
-def _score(amps, lvl):
+def _score(amps, lvl, hz=None, f0=None, ratio=None):
+    """How well does this f0 make the PLATE ANSWER THE VOICE?
+
+    THE PREVIOUS OBJECTIVE OPTIMISED FOR THE WRONG THING, and it is worth being
+    precise about how: it weighted `variety` -- the fraction of the 20 modes that
+    got used -- at 1.2, the largest term. So the search preferred an f0 that
+    spread the figures evenly over the mode ladder, and that is exactly what it
+    produced. Measured on the built timeline: figure occupancy was 9-12% for each
+    of modes 2..7, essentially uniform, and the correlation between the recited
+    pitch and the frequency of the figure on screen was 0.26. The plate was
+    cycling through shapes on a schedule of its own, next to audio it was not
+    listening to. A viewer reads that instantly as "not in sync", which is the
+    correct reading -- it was not.
+
+    Variety is a CONSEQUENCE of a good f0, never a target. A recitation that
+    stays in one register should hold one figure; forcing twenty is the bug.
+
+    So score correspondence instead:
+      coverage -- what fraction of the voice's pitch actually lands inside the
+                  mode ladder's frequency range at all. An f0 whose modes top out
+                  at 443Hz cannot answer a voice whose p90 is 1131Hz, and the old
+                  objective had no term that noticed.
+      tracking -- correlation between log(voice pitch) and log(frequency of the
+                  mode being selected). This is the thing a viewer perceives as
+                  sync: pitch goes up, figure climbs the ladder.
+      purity   -- one mode clearly dominant, so the figure is a figure and not a
+                  blur of three.
+    """
     np = _np()
     live = lvl > 0.25
     if live.sum() < 30:
         return -1.0, {}
     a = amps[live]
     purity = float(np.mean(a.max(axis=1) / (a.sum(axis=1) + 1e-9)))
-    dom = a.argmax(axis=1)
-    variety = len(np.unique(dom)) / float(amps.shape[1])
     activity = float(np.mean(lvl[live]))
-    return purity * 0.5 + variety * 1.2 + activity * 0.3, {
-        "purity": round(purity, 4), "variety": round(variety, 4),
-        "activity": round(activity, 4), "distinct_modes": int(len(np.unique(dom)))}
+    dom = a.argmax(axis=1)
+    det = {"purity": round(purity, 4), "activity": round(activity, 4),
+           "distinct_modes": int(len(np.unique(dom)))}
+
+    coverage = tracking = 0.0
+    if hz is not None and f0 is not None and ratio is not None:
+        mode_hz = np.asarray(f0) * np.asarray(ratio)
+        h = np.asarray(hz)[live]
+        ok = h > 0
+        if ok.sum() >= 30:
+            lo, hi = float(mode_hz.min()), float(mode_hz.max())
+            coverage = float(((h[ok] >= lo) & (h[ok] <= hi)).mean())
+            sel = mode_hz[dom[ok]]
+            lv_, ls_ = np.log(np.maximum(h[ok], 1.0)), np.log(np.maximum(sel, 1.0))
+            if lv_.std() > 1e-6 and ls_.std() > 1e-6:
+                tracking = float(np.corrcoef(lv_, ls_)[0, 1])
+            det["coverage"] = round(coverage, 4)
+            det["tracking"] = round(tracking, 4)
+
+    return coverage * 1.3 + max(tracking, 0.0) * 1.0 + purity * 0.5 + activity * 0.2, det
 
 
 def analyse_track(track, progress=True):
@@ -407,9 +482,18 @@ def analyse_track(track, progress=True):
     _modes, _alpha, ratio = mode_table()
     x = load_mono(track["audio"])
     best = None
-    for f0 in (70.0, 80.0, 95.0, 110.0, 130.0):
+    # THE GRID COULD NOT REACH THE VOICE. Mode frequencies run f0*alpha/alpha0,
+    # so the 20-mode ladder spans about 5.5x its f0 -- meaning the old grid's
+    # best case topped out near 720Hz. Measured against a real recitation, the
+    # dominant pitch has median 410Hz and p90 1131Hz, so most of the voice sat
+    # ABOVE the highest mode and no f0 in the grid could have answered it. The
+    # search was choosing the least-bad option from a set that excluded every
+    # good one, which is invisible in the score: the winner still looks like a
+    # winner. Extended upward so a ladder that actually spans the voice exists
+    # to be chosen.
+    for f0 in (70.0, 95.0, 130.0, 170.0, 220.0, 280.0, 350.0):
         amps, lvl, hz = analyse(x, f0, ratio)
-        sc, det = _score(amps, lvl)
+        sc, det = _score(amps, lvl, hz, f0, ratio)
         if best is None or sc > best[0]:
             best = (sc, f0, amps, lvl, hz, det)
     sc, f0, amps, lvl, hz, det = best
@@ -431,8 +515,8 @@ def analyse_track(track, progress=True):
     return track
 
 
-def schedule_figures(amps, select=6.0, fps=FPS, tau=1.6, hold=3.0,
-                     ratio=1.25, lead=1.5):
+def schedule_figures(amps, select=6.0, fps=FPS, tau=0.55, hold=0.9,
+                     ratio=1.12, lead=0.45):
     """Decide offline which figure is on the plate at every frame.
 
     Doing this live meant the picture trailed the sound. The selector integrated
@@ -445,6 +529,19 @@ def schedule_figures(amps, select=6.0, fps=FPS, tau=1.6, hold=3.0,
     then shift the whole schedule EARLIER by `lead` seconds so the transition
     starts before the audio does and the sand has finished moving by the time
     you hear why.
+
+    THE FIRST VERSION OF THIS OVERCORRECTED INTO A DIFFERENT DESYNC. tau=1.6 and
+    hold=3.0 removed the lag and replaced it with a lock: the figure settled and
+    then sat there for seconds while the recitation moved on. Caught in a real
+    captured frame -- the FIGURE panel read (1,1) while the live mode ladder had
+    (5,1) and (0,3) as the loudest modes, with "figure held 3.9s" printed beside
+    it. Nothing was trailing; the picture had simply stopped answering.
+
+    A cymatics reel changes pattern when the PITCH changes, which in recitation
+    is roughly every half-second to second, not every three. So: smooth over
+    ~0.5s instead of 1.6, hold ~0.9s instead of 3.0, and switch on a 12% margin
+    instead of 25%. `lead` drops with them -- a large pre-shift made sense when a
+    transition took seconds to complete and overshoots once it does not.
     """
     np = _np()
     a = np.power(np.clip(amps, 0.0, None), select, dtype=np.float32)
