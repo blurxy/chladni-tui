@@ -13,7 +13,7 @@ Energy is the INCOHERENT sum  E = sum_i a_i^2 * U_i^2, not (sum a_i U_i)^2.
 The modes sit at incommensurate frequencies, so squaring a coherent sum would
 invent interference nodes no real plate has.
 """
-import os, sys, time, math, signal, argparse, json, glob, struct, fcntl, termios
+import os, random, sys, time, math, signal, argparse, json, glob, struct, fcntl, termios
 import shutil, subprocess
 
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
@@ -1130,7 +1130,8 @@ def main():
     ap.add_argument("--grains", type=int, default=0)
     ap.add_argument("--size", default="")
     ap.add_argument("--seconds", type=float, default=0.0)
-    ap.add_argument("--start", type=float, default=0.0, help="seconds into the timeline")
+    ap.add_argument("--start", type=float, default=None,
+                    help="seconds into the timeline (default: a random track)")
     ap.add_argument("--no-chrome", action="store_true")
     ap.add_argument("--anonymise", "--anonymize", dest="anon", action="store_true",
                     help="redact machine identifiers, for screenshots")
@@ -1176,7 +1177,21 @@ def main():
            else FigureSelector(nm, args.fps))
     fps_meas = args.fps
     offs = tl["offsets"]; total = int(offs[-1])
-    gi = int(np.clip(args.start * args.fps, 0, total - 1))
+    if args.start is None:
+        # START ON A RANDOM TRACK, not at zero. A screensaver is not an album:
+        # it runs for a few minutes and is killed by a keypress, so a fixed start
+        # means only the first track or two is ever seen. Measured on a 38-track,
+        # 118-minute library: starting at 0 every time made everything past
+        # position 3 unreachable in practice, including every long recitation,
+        # because the ordering drains multi-recording surahs first and strands
+        # single-recording ones at the end.
+        #
+        # Snap to a track BOUNDARY rather than a random second, so a session
+        # always opens on the first ayah of something rather than mid-word.
+        starts = [int(o) for o in offs[:-1]] or [0]
+        gi = starts[random.randrange(len(starts))]
+    else:
+        gi = int(np.clip(args.start * args.fps, 0, total - 1))
 
     stats = livestats(info)
 

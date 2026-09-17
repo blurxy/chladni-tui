@@ -101,7 +101,20 @@ def surahs():
 
 
 def reciters():
-    return _json("reciters.json")
+    """Reciters, with display names tidied.
+
+    5 of the 79 upstream names carry the filename's underscores straight into
+    the display string -- "Yasser_Ad-Dussary", "Nasser_Alqatami". Cleaning here
+    rather than at each call site means the search bar, the library and the
+    on-screen credit all agree; a name fixed in only one of those is how the
+    same reciter ends up looking like two.
+    """
+    out = []
+    for r in _json("reciters.json"):
+        r = dict(r)
+        r["name"] = re.sub(r"\s+", " ", r["name"].replace("_", " ")).strip()
+        out.append(r)
+    return out
 
 
 def ayah_counts():
