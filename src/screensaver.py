@@ -64,7 +64,7 @@ DEFAULTS = {
     "gap": 1.5,
     "membrane": "dots",  # off | soft | full | dots -- the plate under the sand
     "framing": "offset",  # offset | centred
-    "hold": 0.0,          # seconds a figure must hold before the next one
+    "hold": 6.0,          # seconds a figure must hold before the next one
 }
 
 
@@ -205,7 +205,6 @@ MODE_HUE = ((np.arange(64, dtype=np.float64) * 0.381966) % 1.0) - 0.5
 
 BRAILLE = np.array([chr(0x2800 + i) for i in range(256)], dtype="<U1")
 DOTW = np.array([[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]], dtype=np.uint16)
-ARCH_GLYPH = ""          # nf-linux-archlinux
 
 # A braille sub-dot is 2 wide x 4 tall inside one cell, so it is square only if
 # the cell is exactly 1:2. Iosevka is condensed -- measured here the cell runs
@@ -1117,36 +1116,18 @@ def wrap(text, width, lines):
     return out[:lines]
 
 
-def arch_braille(h_rows, w_cols):
-    """The Arch mark as braille, for a chrome panel rather than the sand field."""
-    H, W = h_rows * 4, w_cols * 2
-    t = np.linspace(0.0, 1.0, H, dtype=np.float32)[:, None]
-    x = np.abs(np.linspace(-1.0, 1.0, W, dtype=np.float32))[None, :]
-    # Clamp BEFORE the fractional power: a negative base returns NaN and
-    # silently fills the top of the logo with garbage.
-    outer = t ** 1.35
-    inner = np.clip(t - 0.30, 0.0, None) ** 1.35 * 1.03
-    m = (x <= outer) & (x >= inner)
-    g = m.reshape(h_rows, 4, w_cols, 2)
-    code = (g * DOTW[None, :, None, :]).sum(axis=(1, 3)).astype(np.uint8)
-    ch = BRAILLE[code]
-    ch[code == 0] = " "
-    return ch
-
-
-# -------------------------------------------------------------- dashboard ---
 def draw(chrome, st):
     ch = chrome
     cols, rows = ch.cols, ch.rows
     ch.clear()
     pw = int(np.clip(cols // 5, 28, 38))
     lx, rx = 2, cols - 2 - pw
-    F, L, V, A, AR, B, D = (C["rule"], C["label"], C["value"], C["accent"],
-                            C["arch"], C["bright"], C["dim"])
+    F, L, V, A, B, D = (C["rule"], C["label"], C["value"], C["accent"],
+                        C["bright"], C["dim"])
 
     # --- top bar -------------------------------------------------------------
     ch.rule(1, 2, cols - 4, F)
-    ch.put(0, 2, ARCH_GLYPH + "  OMARCHY", AR)
+    ch.put(0, 2, "OMARCHY", L)
     ch.put(0, 14, "\u00b7  CYMATICS", B)
     ch.put(0, 27, "\u00b7  a recitation, resolved into standing waves", L)
     right = "%s  \u00b7  %s  \u00b7  %s" % (st["theme"], st["res"] or "", time.strftime("%H:%M:%S"))
@@ -1192,12 +1173,6 @@ def draw(chrome, st):
         ch.put(y + 1 + i, lx + 9, "\u2501" * k, A if mi == st["dom"] else V)
         ch.put(y + 1 + i, lx + 9 + k, "\u00b7" * (bw - k), D)
     y += show + 3
-
-    # --- the Arch mark, if the column has room left --------------------------
-    if rows - y > 9:
-        art = arch_braille(min(9, rows - y - 5), min(14, pw - 4))
-        for i in range(art.shape[0]):
-            ch.put(y + i, lx + (pw - art.shape[1]) // 2, "".join(art[i].tolist()), AR)
 
     # --- right column --------------------------------------------------------
     y = 3
