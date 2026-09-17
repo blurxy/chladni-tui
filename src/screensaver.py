@@ -62,7 +62,9 @@ DEFAULTS = {
     "panels": "focus",   # focus | full | off
     "tint": 0.22,
     "gap": 1.5,
-    "membrane": "soft",  # off | soft | full | dots -- the plate under the sand
+    "membrane": "dots",  # off | soft | full | dots -- the plate under the sand
+    "framing": "offset",  # offset | centred
+    "hold": 0.0,          # seconds a figure must hold before the next one
 }
 
 
@@ -160,6 +162,11 @@ BG0 = NLEV + len(CK)
 # "dots" draws the same field in braille instead, at the sand's own
 # resolution, which cannot band; it costs a glyph in cells that were empty.
 MEMBRANE = {"off": 0.0, "soft": 0.35, "full": 1.0, "dots": 1.0}
+# Below this width "dots" falls back to the wash. The braille threshold is an
+# 8x8 Bayer tile over SUB-DOTS, which is 4 cells wide -- at 165 columns that is
+# 2.4% of the screen and the antinodes render as square patches of the DITHER
+# rather than of the field. Measured: invisible at 280 columns, obvious at 165.
+DOTS_MIN_COLS = 200
 
 
 def build_lut(hue_shift=0.0):
@@ -229,7 +236,7 @@ class ModeBank:
     """
 
     def __init__(self, mn, subw, subh, maxw=448, rim_floor=0.032, rim_strength=0.17,
-                 select=6.0, rad_scale=0.48, cy_shift=0.0):
+                 select=6.0, rad_scale=0.48, cy_shift=0.0, cx_shift=0.0):
         self.pw = int(min(subw, maxw))
         self.ph = max(8, int(round(self.pw * (subh * SUB_ASPECT) / float(subw))))
         pw, ph = self.pw, self.ph
@@ -241,7 +248,8 @@ class ModeBank:
         rad = rad_scale * min(float(pw), float(ph))
         cy = (ph - 1) / 2.0 + cy_shift
         yy = (np.arange(ph, dtype=np.float32)[:, None] - cy) / rad
-        xx = (np.arange(pw, dtype=np.float32)[None, :] - (pw - 1) / 2.0) / rad
+        cx = (pw - 1) / 2.0 + cx_shift
+        xx = (np.arange(pw, dtype=np.float32)[None, :] - cx) / rad
         r = np.hypot(xx, yy); th = np.arctan2(yy, xx)
         self.inside = r <= 1.0
         self.r = r
@@ -323,7 +331,12 @@ class ModeBank:
         self.bgx = bgx.reshape(-1).astype(np.float32)
         self.bgy = bgy.reshape(-1).astype(np.float32)
         self.out_flat = out.reshape(-1)
-        self.cxp = (pw - 1) / 2.0; self.cyp = float(cy); self.rad = float(rad)
+        # cxp/cyp are the plate's centre for EVERYTHING downstream -- the rim
+        # ring, escaped-grain reinjection, and the resize remap all read them.
+        # Hardcoding cxp to the middle while the field was drawn around cx left
+        # the ring orbiting the wrong point and threw recycled grains outside
+        # the disc.
+        self.cxp = float(cx); self.cyp = float(cy); self.rad = float(rad)
         self._scale = None
 
     def field_w(self, w):
@@ -405,8 +418,9 @@ class FigurePlayer:
     # ruinous as a steady state. Figures change every 1.08s (median), so a 1.0s
     # fade counted in frames at the TARGET rate stretched to 2.1s real and the
     # plate showed a blend 75% of the time. At 0.35s real it is 19%.
-    def __init__(self, nm, fps, fade=0.35):
+    def __init__(self, nm, fps, fade=0.35, min_hold=0.0):
         self.nm = nm; self.fps = float(fps); self.fade = float(fade)
+        self.min_hold = float(min_hold)
         self.cur = -1; self.prev = -1; self.left = 0.0; self.since = 0.0
 
     def update_to(self, idx, dt=None):
@@ -415,6 +429,13 @@ class FigurePlayer:
         dt = (1.0 / self.fps) if dt is None else float(dt)
         self.since += dt
         idx = int(idx)
+        # A FLOOR ON HOW OFTEN THE PICTURE MAY CHANGE. The schedule is built from
+        # the recitation and changes every 1.08s at the median, which is faster
+        # than sand settles and faster than anyone can look. Holding the current
+        # figure past a change does not desynchronise anything -- the next change
+        # the schedule asks for is simply the one taken.
+        if idx != self.cur and self.since < self.min_hold:
+            idx = self.cur
         if idx != self.cur:
             self.prev = self.cur
             self.cur = idx
@@ -953,6 +974,7 @@ def sysinfo():
 
 
 TOP_ROWS = 2      # title + rule
+PLATE_OFFSET = 0.055   # fraction of the width the plate sits right of centre
 # A FIXED GRID. Every band below the plate has a constant height, so the
 # layout is identical no matter which ayah is playing. It used to derive the
 # band's top edge from the wrapped line count -- a long verse grew the block
@@ -966,8 +988,15 @@ BOT_ROWS = AYAH_ROWS + STRIP_ROWS + 1    # + one clear row above the bar
 def plate_fit(cols, rows):
     """Radius and vertical offset so the whole plate sits between the chrome."""
     usable = max(6, rows - TOP_ROWS - BOT_ROWS)
+    # OFF-CENTRE ON PURPOSE. A Chladni figure is already radially symmetric;
+    # centring it in a rectangle doubles the symmetry and the whole screen reads
+    # as a specimen in a display case. Pushed right, away from the DRIVEN MODES
+    # ladder, so the two stop competing for the left margin and the negative
+    # space either side is unequal.
+    off = PLATE_OFFSET if SETTINGS.get("framing", "offset") == "offset" else 0.0
     return {"rad_scale": 0.435 * (usable / float(rows)),
-            "cy_shift": (TOP_ROWS - BOT_ROWS) / 2.0 * 4.0}
+            "cy_shift": (TOP_ROWS - BOT_ROWS) / 2.0 * 4.0,
+            "cx_shift": off * cols * 2.0}
 
 
 def plate_ring(bank, subw, subh, ticks=72, tick_len=0.035, ring=True):
@@ -1208,24 +1237,6 @@ def draw(chrome, st):
         ch.kv(y + 6, rx + 2, pw - 4, "figure held", "%.1fs" % st["held"], L, V)
         y += 9
 
-    if full and rows - y > 13:
-        ch.panel(y, rx, pw, 13, "SYSTEM", F, A)
-        ch.kv(y + 1, rx + 2, pw - 4, "os", st["os"][:pw - 8], L, V)
-        ch.kv(y + 2, rx + 2, pw - 4, "kernel", st["kernel"][:pw - 12], L, V)
-        ch.kv(y + 3, rx + 2, pw - 4, "wm", "Hyprland", L, V)
-        ch.kv(y + 4, rx + 2, pw - 4, "cpu", st["cpu"][:pw - 9] or "\u2014", L, V)
-        ch.kv(y + 5, rx + 2, pw - 4, "gpu", st["gpu"][:pw - 9] or "\u2014", L, V)
-        ch.kv(y + 6, rx + 2, pw - 4, "pkgs \u00b7 shell",
-              "%s \u00b7 %s" % (st["pkgs"] or "\u2014", st["shell"]), L, V)
-        ch.put(y + 7, rx + 2, "mem", L)
-        ch.bar(y + 7, rx + 8, pw - 20, st["mem_pct"], A, D, empty="\u00b7")
-        ch.put(y + 7, rx + pw - 11, "%5d MB" % st["mem_used"], V)
-        tval = "\u2014" if st["temp"] is None else "%.0f\u00b0C" % st["temp"]
-        ch.kv(y + 8, rx + 2, pw - 4, "cpu temp", tval, L, V)
-        ch.kv(y + 9, rx + 2, pw - 4, "load", "%.2f" % st["load"], L, V)
-        ch.kv(y + 10, rx + 2, pw - 4, "uptime", st["uptime"], L, V)
-        ch.kv(y + 11, rx + 2, pw - 4, "host", st["host"][:pw - 10], L, V)
-
     # --- the ayah, across the full width ------------------------------------
     # The words are the reason any of this is on screen, so they get the full
     # width rather than the ~30-column left panel that ellipsised them.
@@ -1325,9 +1336,11 @@ RUN = {"go": True, "resized": False}
 HINTS = {"until": 0.0}
 
 
-def membrane_mode():
-    """(strength, dots) for however the membrane is currently set."""
-    m = SETTINGS.get("membrane", "soft")
+def membrane_mode(cols):
+    """(strength, dots) for however the membrane is set, at this width."""
+    m = SETTINGS.get("membrane", "dots")
+    if m == "dots" and cols < DOTS_MIN_COLS:
+        return MEMBRANE["soft"], False
     return MEMBRANE.get(m, 0.35), m == "dots"
 
 
@@ -1585,6 +1598,8 @@ MENU_ITEMS = [
     ("subtitles", "subtitles",    [True, False],               "live"),
     ("panels",    "panels",       ["focus", "full", "off"],    "live"),
     ("membrane",  "membrane",     ["off", "soft", "full", "dots"], "live"),
+    ("framing",   "framing",      ["offset", "centred"],       "next launch"),
+    ("hold",      "stillness",    [0.0, 1.5, 3.0, 6.0],        "live"),
 ]
 
 MENU_HELP = {
@@ -1598,6 +1613,8 @@ MENU_HELP = {
     "subtitles": "the ayah, its transliteration and its meaning",
     "panels":    "focus keeps what explains the art; full adds the telemetry",
     "membrane":  "the vibrating plate under the sand. dots draws it at 8x the\n                  resolution of a cell background, which cannot show blocks",
+    "framing":   "offset puts the plate right of centre; a symmetric figure centred\n                  in a rectangle reads as a specimen in a case",
+    "hold":      "seconds a figure must stay before the schedule may change it.\n                  0 follows the recitation exactly; higher trades response for calm",
 }
 
 
@@ -1872,7 +1889,7 @@ def main():
         info["kernel"] = info["kernel"].split("-")[0] if info["kernel"] else ""
 
 
-    sel = (FigurePlayer(nm, args.fps) if tl.get("fig") is not None
+    sel = (FigurePlayer(nm, args.fps, min_hold=float(SETTINGS.get("hold", 0.0))) if tl.get("fig") is not None
            else FigureSelector(nm, args.fps))
     fps_meas = args.fps
     pending_size, pending_at = (0, 0), 0.0
@@ -1932,7 +1949,7 @@ def main():
 
     if args.dump:
         amps = tl["amps"][gi]
-        sel = (FigurePlayer(nm, args.fps) if tl.get("fig") is not None
+        sel = (FigurePlayer(nm, args.fps, min_hold=float(SETTINGS.get("hold", 0.0))) if tl.get("fig") is not None
                else FigureSelector(nm, args.fps))
         for _ in range(int(args.fps * 4)):
             w = (sel.update_to(tl["fig"][gi]) if tl.get("fig") is not None
@@ -1948,7 +1965,7 @@ def main():
         fps_meas = 0.0          # nothing was timed; the dashboard shows a dash
         for i in range(700):
             sand.step(E, GX, GY, 0.85 if i < 60 else 0.30)
-        scr.set_field_bg(E, bank, *membrane_mode())
+        scr.set_field_bg(E, bank, *membrane_mode(cols))
         ch, lv, bgv = scr.compose(sand, gain)
         if not args.no_chrome:
             draw(chrome, state(gi, amps, (sel.cur,)))
@@ -2046,7 +2063,7 @@ def main():
             fading = float(getattr(sel, "left", 0.0)) > 0.0
             if sel.cur != last_fig or fading or was_fading:
                 last_fig = sel.cur
-                scr.set_field_bg(E, bank, *membrane_mode())
+                scr.set_field_bg(E, bank, *membrane_mode(cols))
             was_fading = fading
             # Loudness drives how hard the plate is hit; the spectrum decides
             # which modes. Keeping them separate stops quiet passages freezing
