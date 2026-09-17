@@ -17,9 +17,47 @@ import os
 import random, sys, time, math, signal, argparse, json, glob, struct, fcntl, termios
 import shutil, subprocess
 
+# BLAS THREAD COUNT IS A HEAT-VERSUS-SMOOTHNESS TRADE, measured live on a 240Hz
+# monitor at 1920x1080 (65,102 grains), one short run each, so read the thermals
+# as indicative -- two lab VMs were running alongside:
+#
+#     threads  --fps   achieved   renderer CPU   package temp     throttle events
+#        1     auto       43 fps        97%      48C avg, 66 peak        0
+#        2      60        58 fps       161%      78C avg, 85 peak        0
+#        2     auto      100 fps         -       82C avg, 100 peak     523
+#        4      60        60 fps       330%        ~95 peak             16
+#        4     auto      115 fps       390%       ~100               ~700 in 40s
+#
+# A headless benchmark of physics and compositing alone said four threads were no
+# faster than one (5.9 vs 6.1 ms/frame). That was true of what it timed and
+# wrong about the live loop, which also builds and writes the frame.
+#
+# So the default follows the power source: plugged in, 2 threads for the fluid
+# end of the table; on battery, 1 thread, because a screensaver runs while nobody
+# is watching and on battery its heat is also charge. Override per launch with
+# OPENBLAS_NUM_THREADS.
+def _on_external_power(root="/sys/class/power_supply"):
+    supplies = glob.glob(os.path.join(root, "*"))
+    has_battery = False
+    for d in supplies:
+        try:
+            with open(os.path.join(d, "type")) as fh:
+                typ = fh.read().strip()
+            if typ == "Battery":
+                has_battery = True
+            elif typ in ("Mains", "USB"):          # USB-C power delivery reports as USB
+                with open(os.path.join(d, "online")) as fh:
+                    if fh.read().strip() == "1":
+                        return True
+        except OSError:
+            continue
+    return not has_battery                          # no battery at all: a desktop
+
+
+_THREADS = "2" if _on_external_power() else "1"
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
            "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
-    os.environ.setdefault(_v, "4")
+    os.environ.setdefault(_v, _THREADS)
 import numpy as np
 from scipy.special import jv
 
