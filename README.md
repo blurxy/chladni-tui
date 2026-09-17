@@ -9,7 +9,9 @@ interior rings, at 0.377 and 0.690 of the radius where J₁'s zeros put them. It
 frequency is **550 Hz**; the peak in the voice at that moment is **551 Hz**. That is
 one well-chosen frame: across the whole library the correlation between recited
 pitch and the figure shown is a median of 0.50 per track. Rendered headlessly by
-`tools/render-dump.py`, so it carries no desktop.</sub>
+`tools/render-dump.py`, so it carries no desktop — and note what `--dump` is: it
+holds one figure for 700 physics steps before drawing, so this is a fully settled
+figure. Live, figures change about once a second and their lines render dimmer.</sub>
 
 Sand on a vibrating plate collects wherever the plate is still. This simulates
 that — 45,000 to 300,000 grains depending on plate size, on a clamped circular
@@ -146,6 +148,26 @@ travelled five times as far: "settled" fell from 99% to 69% and figures held for
 the clock rather than the requested rate, because asked for 120 the renderer
 sustains about 67–89 — a timestep derived from the flag would have run the physics
 at 55% speed. The default rate is the refresh rate of the monitor it opens on.
+
+**The live screensaver drew dots while `--dump` drew lines** — three defects,
+found only after three plausible explanations were each ruled out by measurement.
+Not convergence: a static figure puts 81–85% of its grains on its nodal lines
+within 1.8 s at every frame rate. Not the schedule: replaying real excerpts
+headlessly, sand sits on the *current* figure's lines 74% of the time. The physics
+was right; the drawing was wrong.
+*First*, the crossfade was counted in frames at the target rate — 240 on a 240 Hz
+monitor — while the renderer ran at 115, stretching a one-second fade to two.
+Two blended modes vanish together only at points, and with figures changing every
+1.08 s the plate was mid-blend **75%** of the time. It is now timed by the clock
+and lasts 0.35 s: 13%. *Second*, the background wash froze on the previous figure:
+its docstring said it was redrawn during a crossfade, but its call site fired only
+on the first frame of one, so each new figure's lines ran across the old figure's
+bright regions (mean wash level under on-line sand 0.47, against 0.03 from the
+current field). *Third*, ghost dots: a sub-dot was lit when its decaying history
+was above zero, and a float multiplied by 0.88 takes hundreds of frames to reach
+zero, so **20.7%** of the canvas stayed lit with trails of sand that had long since
+left. `--dump` never showed any of this because it draws once, from a fresh
+buffer. Lit area over real playback is now 6.1%.
 
 **Every visual check was of the wrong program.** The screenshots were real,
 correctly captured, and of a stale window: `setsid foot &` returns a PID that is
