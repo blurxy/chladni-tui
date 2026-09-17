@@ -111,7 +111,7 @@ C = {k: NLEV + i for i, k in enumerate(CK)}
 BG_STOPS = [(0.00, GROUND), (0.30, (0x1c, 0x26, 0x33)),
             (0.60, (0x24, 0x35, 0x49)), (0.85, (0x2c, 0x44, 0x5f)),
             (1.00, (0x35, 0x53, 0x72))]
-NBG = 5
+NBG = 10                       # see set_field_bg: 5 levels banded into visible blocks
 BG0 = NLEV + len(CK)
 
 
@@ -617,8 +617,22 @@ class Screen:
                      0, bank.pw - 1).astype(np.int32)
         cell = E.reshape(bank.ph, bank.pw)[ys[:, None], xs[None, :]]
         inside = bank.inside[ys[:, None], xs[None, :]]
+        # QUANTISED AND DITHERED. A cell is the smallest thing that can hold a
+        # background colour -- braille sub-dots only carry the foreground -- so
+        # this wash is drawn at one colour per CELL while the sand is drawn at
+        # 2x4 per cell. With 5 levels the steps between them landed on cell
+        # boundaries and the plate read as a grid of blocks, which got worse when
+        # the wash was brightened: measured on a 187x38 window (a real screensaver
+        # window at font size 18) the whole disc is only 38 cells tall, so each
+        # block is enormous. More levels shrink each step, and an ordered Bayer
+        # threshold scatters the remaining boundary so it stops lining up into
+        # rectangles. The pattern depends only on cell POSITION, so it is static:
+        # it costs nothing in the frame-to-frame diff that drives output size.
         v = np.clip(np.sqrt(np.clip(cell, 0.0, 1.0)) * strength, 0.0, 1.0)
-        lvl = (v * (NBG - 1) + 0.5).astype(np.uint8)
+        bay = (np.array([[0, 8, 2, 10], [12, 4, 14, 6],
+                         [3, 11, 1, 9], [15, 7, 13, 5]], dtype=np.float32) + 0.5) / 16.0
+        dith = np.tile(bay, (rows // 4 + 1, cols // 4 + 1))[:rows, :cols]
+        lvl = np.clip(np.floor(v * (NBG - 1) + dith), 0, NBG - 1).astype(np.uint8)
         lvl[~inside] = 0
         self.bg = lvl
 
@@ -909,7 +923,7 @@ def sysinfo():
 
 
 TOP_ROWS = 2      # title + rule
-BOT_ROWS = 9      # ayah band + rule + drive/passage + note + hint
+BOT_ROWS = 11     # ayah band (header, 2 translit, 3 translation) + rule + bars + note + hint
 
 
 def plate_fit(cols, rows):
@@ -985,6 +999,37 @@ def livestats(info):
 def mmss(sec):
     sec = max(0, int(sec))
     return "%d:%02d" % (sec // 60, sec % 60)
+
+
+_LONG_VOWELS = (("aa", "\u0101"), ("Aa", "\u0100"), ("AA", "\u0100"),
+                ("ee", "\u012b"), ("Ee", "\u012a"), ("EE", "\u012a"),
+                ("oo", "\u016b"), ("Oo", "\u016a"), ("OO", "\u016a"),
+                ("uu", "\u016b"), ("Uu", "\u016a"),
+                ("ii", "\u012b"), ("Ii", "\u012a"))
+
+
+def accent(s):
+    """Mark the long vowels in the transliteration, for reading aloud.
+
+    alquran.cloud publishes exactly one English transliteration and it is the
+    plain kind -- checked, the only transliteration editions are en, tr and ru,
+    none of them diacritic -- so "laahu" rather than "lahu" with a macron. That
+    romanisation is systematic about length: a doubled vowel IS a long vowel, so
+    the macrons can be put back mechanically. "Qul huwal laahu ahad" becomes
+    "Qul huwal lahu ahad" with the a long, which is what tells you where to hold
+    the syllable.
+
+    WHAT THIS CANNOT RECOVER, because the source never encoded it: the emphatic
+    consonants (s d t z with a dot beneath), and the difference between hamza and
+    ayn, which this edition writes with the same apostrophe. So it is a guide to
+    vowel length, not a scholarly romanisation, and the rest of the word is left
+    exactly as the source wrote it.
+    """
+    if not s:
+        return s
+    for a, b in _LONG_VOWELS:
+        s = s.replace(a, b)
+    return s
 
 
 def wrap(text, width, lines):
@@ -1146,11 +1191,21 @@ def draw(chrome, st):
     # proximity rule, where distance encodes relatedness.
     tl_, tr_ = st["ayah_text"]
     GAP = 1
-    wide = min(cols - 8, 150)
+    # MEASURE, not full width. Lines ran to 150 columns -- about 130 characters --
+    # where running text is comfortable near 65-75. The words are the reason any of
+    # this is on screen, so they get a readable column rather than the whole screen.
+    wide = min(cols - 8, 110)
+    # THE TRANSLATION GETS THREE LINES; THE TRANSLITERATION TWO. Measured across
+    # all 760 ayat in the library: translations run to a median of 72 characters
+    # but a 99th percentile of 397 and a maximum of 583. At two lines there is no
+    # width that fits them -- even at 150 columns, 2.4% were cut off with an
+    # ellipsis, which is the "translation doesn't fit" this band kept showing.
+    # Three lines at 110 columns leaves about 2% still clipped, and 110 is close
+    # enough to a readable measure to be worth the trade.
     tl_lines = [l for l in wrap(tl_, wide, 2) if l] if tl_ else []
-    tr_lines = [l for l in wrap(tr_, wide, 2) if l] if tr_ else []
+    tr_lines = [l for l in wrap(tr_, wide, 3) if l] if tr_ else []
     # header + gap + translit + gap*2 + translation, sitting directly above the rule
-    block = 1 + GAP + len(tl_lines) + (GAP * 2 + len(tr_lines) if tr_lines else 0)
+    block = 1 + GAP + len(tl_lines) + (GAP * 2 + 1 + len(tr_lines) if tr_lines else 0)
     ay = (rows - 4) - block - 1          # one clear row above the rule, always
     if tl_lines and ay > 4:
         hdr = "%d : %d   of %d   \u00b7   %s   \u00b7   %s" % (
@@ -1160,9 +1215,14 @@ def draw(chrome, st):
         for ln in tl_lines:
             ch.put(r, max(2, (cols - len(ln)) // 2), ln, B)
             r += 1
-        r += GAP * 2 - 1
+        # TWO blank rows before the translation, one after the header. The
+        # previous version wrote GAP*2 - 1 here, which is a single blank row --
+        # the same as the header gap -- so the three parts read as one block
+        # instead of a label, a line to read aloud, and its meaning. Proximity is
+        # the whole point: distance is what says these are different things.
+        r += GAP * 2
         for ln in tr_lines:
-            ch.put(r, max(2, (cols - len(ln)) // 2), ln, L)
+            ch.put(r, max(2, (cols - len(ln)) // 2), ln, V)
             r += 1
 
     # --- bottom ---------------------------------------------------------------
@@ -1522,6 +1582,8 @@ def main():
         frac = np.clip((local - (ayat[ai] if ayat else 0.0)) / span, 0.0, 1.0)
         words = md.get("text") or tl.get("fatiha") or []
         txt = tuple(words[ai]) if ai < len(words) else ("", "")
+        if txt and txt[0]:
+            txt = (accent(txt[0]),) + tuple(txt[1:])
         return {"name": md["name"], "sub": md["sub"], "f0": md["f0"],
                 "t": local, "dur": dur, "amps": amps, "mn": tl["mn"], "alpha": tl["alpha"],
                 "dom": int(held[0]), "level": float(tl["lvl"][gi]), "hz": float(tl["hz"][gi]),
