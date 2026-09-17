@@ -62,7 +62,7 @@ DEFAULTS = {
     "panels": "focus",   # focus | full | off
     "tint": 0.22,
     "gap": 1.5,
-    "wash": 0.55,      # membrane glow under the sand; 0 = sand only
+    "membrane": "soft",  # off | soft | full | dots -- the plate under the sand
 }
 
 
@@ -154,6 +154,12 @@ BG_STOPS = [(0.00, GROUND), (0.30, (0x1c, 0x26, 0x33)),
             (1.00, (0x35, 0x53, 0x72))]
 NBG = 10                       # see set_field_bg: 5 levels banded into visible blocks
 BG0 = NLEV + len(CK)
+# How hard the membrane is drawn, and how. A cell BACKGROUND is the coarsest
+# thing on screen -- one colour for 2x4 sub-dots -- so at a real window size
+# the wash quantises into visible rectangles however finely it is computed.
+# "dots" draws the same field in braille instead, at the sand's own
+# resolution, which cannot band; it costs a glyph in cells that were empty.
+MEMBRANE = {"off": 0.0, "soft": 0.35, "full": 1.0, "dots": 1.0}
 
 
 def build_lut(hue_shift=0.0):
@@ -610,8 +616,10 @@ class Screen:
         self.accum = None      # decaying grain-visit buffer, see compose()
         self.bg = np.zeros((rows, cols), dtype=np.uint8)
         self.prev_bg = np.full((rows, cols), 255, dtype=np.uint8)
+        self.memb = None
+        self.memb_lv = None
 
-    def set_field_bg(self, E, bank, strength=1.0):
+    def set_field_bg(self, E, bank, strength=1.0, dots=False):
         """Wash the plate with the energy driving it.
 
         Recomputed only when the field changes -- during a held figure E is
@@ -647,7 +655,32 @@ class Screen:
         dith = np.tile(bay, (rows // 4 + 1, cols // 4 + 1))[:rows, :cols]
         lvl = np.clip(np.floor(v * (NBG - 1) + dith), 0, NBG - 1).astype(np.uint8)
         lvl[~inside] = 0
-        self.bg = lvl
+        if not dots:
+            self.bg = lvl
+            self.memb = None
+            return
+        # THE SAME FIELD, AT THE SAND'S RESOLUTION. Sampled per sub-dot and
+        # thresholded against an 8x8 Bayer matrix tiled over the SUB-DOT grid --
+        # deliberately not 2x4, so the threshold pattern does not repeat on cell
+        # boundaries and cannot reassemble into the blocks this exists to avoid.
+        # Cells keep a colour each (one foreground per cell is a terminal
+        # limit); it is the dot DENSITY that carries the shape.
+        self.bg = np.zeros_like(lvl)
+        ys4 = np.clip(np.arange(rows * 4) * (bank.ph / float(self.subh)),
+                      0, bank.ph - 1).astype(np.int32)
+        xs2 = np.clip(np.arange(cols * 2) * (bank.pw / float(self.subw)),
+                      0, bank.pw - 1).astype(np.int32)
+        vs = np.sqrt(np.clip(E2[ys4[:, None], xs2[None, :]], 0.0, 1.0)) * strength
+        b8 = (np.array([[0, 32, 8, 40, 2, 34, 10, 42], [48, 16, 56, 24, 50, 18, 58, 26],
+                        [12, 44, 4, 36, 14, 46, 6, 38], [60, 28, 52, 20, 62, 30, 54, 22],
+                        [3, 35, 11, 43, 1, 33, 9, 41], [51, 19, 59, 27, 49, 17, 57, 25],
+                        [15, 47, 7, 39, 13, 45, 5, 37], [63, 31, 55, 23, 61, 29, 53, 21]],
+                       dtype=np.float32) + 0.5) / 64.0
+        thr = np.tile(b8, (rows * 4 // 8 + 1, cols * 2 // 8 + 1))[:rows * 4, :cols * 2]
+        on = (vs > thr) & bank.inside[ys4[:, None], xs2[None, :]]
+        self.memb = (on.reshape(rows, 4, cols, 2) * DOTW[None, :, None, :]
+                     ).sum(axis=(1, 3)).astype(np.uint16)
+        self.memb_lv = (BG0 + lvl).astype(np.uint8)
 
     def set_underlay(self, dots, level):
         """A static sub-dot layer drawn beneath the sand.
@@ -725,6 +758,13 @@ class Screen:
         if self.under is not None:
             # where only the underlay is lit, use its own (dim) level
             lv = np.where((dens <= 0) & (self.under != 0), self.under_lv, lv)
+        # The membrane only fills cells the sand has left empty: one foreground
+        # colour per cell means a cell holding sand cannot also show the plate,
+        # and the sand is what the picture is of.
+        if self.memb is not None:
+            fill = (code == 0) & (self.memb != 0)
+            code = np.where(fill, self.memb, code)
+            lv = np.where(fill, self.memb_lv, lv)
         ch = BRAILLE[np.asarray(code, dtype=np.uint8)]
         blank = code == 0
         ch[blank] = " "
@@ -1285,6 +1325,12 @@ RUN = {"go": True, "resized": False}
 HINTS = {"until": 0.0}
 
 
+def membrane_mode():
+    """(strength, dots) for however the membrane is currently set."""
+    m = SETTINGS.get("membrane", "soft")
+    return MEMBRANE.get(m, 0.35), m == "dots"
+
+
 def _stop(*_a):
     RUN["go"] = False
 
@@ -1538,7 +1584,7 @@ MENU_ITEMS = [
     ("gap",       "gap",          [0.0, 1.5, 3.0, 6.0],        "live"),
     ("subtitles", "subtitles",    [True, False],               "live"),
     ("panels",    "panels",       ["focus", "full", "off"],    "live"),
-    ("wash",      "membrane",     [0.0, 0.35, 0.55, 0.8, 1.0], "live"),
+    ("membrane",  "membrane",     ["off", "soft", "full", "dots"], "live"),
 ]
 
 MENU_HELP = {
@@ -1551,7 +1597,7 @@ MENU_HELP = {
     "gap":       "seconds of quiet between recitations",
     "subtitles": "the ayah, its transliteration and its meaning",
     "panels":    "focus keeps what explains the art; full adds the telemetry",
-    "wash":      "glow of the vibrating plate under the sand. 0 leaves only sand",
+    "membrane":  "the vibrating plate under the sand. dots draws it at 8x the\n                  resolution of a cell background, which cannot show blocks",
 }
 
 
@@ -1902,7 +1948,7 @@ def main():
         fps_meas = 0.0          # nothing was timed; the dashboard shows a dash
         for i in range(700):
             sand.step(E, GX, GY, 0.85 if i < 60 else 0.30)
-        scr.set_field_bg(E, bank, float(SETTINGS.get("wash", 0.55)))
+        scr.set_field_bg(E, bank, *membrane_mode())
         ch, lv, bgv = scr.compose(sand, gain)
         if not args.no_chrome:
             draw(chrome, state(gi, amps, (sel.cur,)))
@@ -2000,7 +2046,7 @@ def main():
             fading = float(getattr(sel, "left", 0.0)) > 0.0
             if sel.cur != last_fig or fading or was_fading:
                 last_fig = sel.cur
-                scr.set_field_bg(E, bank, float(SETTINGS.get("wash", 0.55)))
+                scr.set_field_bg(E, bank, *membrane_mode())
             was_fading = fading
             # Loudness drives how hard the plate is hit; the spectrum decides
             # which modes. Keeping them separate stops quiet passages freezing
