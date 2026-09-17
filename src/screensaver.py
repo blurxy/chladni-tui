@@ -1260,7 +1260,6 @@ def main():
     sand = Sand(ngrain, subw, subh, bank, fps=args.fps)
     sand.dts = Sand.REF_FPS / max(args.fps, 1.0)
     _last_step_t = 0.0
-    info["fps_target"] = args.fps
     gain = 1.0 / max(3.0, ngrain / float(cols * rows) * 4.5)
     chrome = Chrome(cols, rows)
     scr.set_underlay(plate_ring(bank, subw, subh), C["rule"])
