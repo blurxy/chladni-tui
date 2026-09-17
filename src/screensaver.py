@@ -191,6 +191,40 @@ class ModeBank:
                 if sel_.any() and ei[sel_].max() > 0.02:
                     rc = float(rad_bins[b - 1]); break
             self.r_core[i] = rc
+        # EACH MODE'S ANGULAR FACTOR, cos^2(m*theta), for shaping the centre.
+        # J_m(alpha*r) fades as r^m toward the middle, but cos(m*theta) does not
+        # fade at all: it is exactly zero on the m nodal diameters at EVERY
+        # radius. So the diameters still exist inside the dead zone even though
+        # the full field has flattened to nothing there -- they are just invisible
+        # to anything that only looks at magnitude.
+        # Its gradient is TANGENTIAL -- cos^2(m*theta) does not vary with r -- so
+        # -grad runs along circles toward the nearest nodal diameter and never
+        # outward. COMPUTED ANALYTICALLY, NOT WITH np.gradient: finite differences
+        # of a polar pattern sampled on a Cartesian grid leak small RADIAL
+        # components, and a small outward drift repeated over hundreds of steps
+        # still empties the core. Measured with np.gradient on a (4,1) field: no
+        # sand inside r=0.10 and +0.03 of outward drift sitting on the nodal
+        # diameter itself. "Purely tangential" was true of the maths and false of
+        # the discretisation. Here it is true by construction:
+        #     grad f = (1/r)(df/dtheta) theta_hat,  df/dtheta = -m sin(2 m theta)
+        # in plate units, divided by rad for per-pixel units like every other
+        # field. Faded to zero within a few sub-dots of the origin, where theta
+        # changes by more than a mode's lobe per pixel and is not resolvable.
+        rpx = r * np.float32(rad)
+        fade = np.clip((rpx - 2.0) / 3.0, 0.0, 1.0).astype(np.float32)
+        safe_r = np.maximum(r, np.float32(1e-6))
+        ang = np.zeros((len(mn), ph, pw), dtype=np.float32)
+        agx = np.zeros_like(ang); agy = np.zeros_like(ang)
+        for i, (m, _n) in enumerate(mn):
+            m = int(m)
+            if m > 0:
+                ang[i] = np.cos(m * th) ** 2 * fade
+                dfdt = -m * np.sin(2 * m * th) / (safe_r * np.float32(rad)) * fade
+                agx[i] = dfdt * -np.sin(th)
+                agy[i] = dfdt * np.cos(th)
+        self.ANG = ang.reshape(len(mn), -1)
+        self.AGX = agx.reshape(len(mn), -1).astype(np.float32)
+        self.AGY = agy.reshape(len(mn), -1).astype(np.float32)
         gy, gx = np.gradient(E2, axis=(1, 2))
         self.E2 = E2.reshape(len(mn), -1)
         self.GX = gx.reshape(len(mn), -1).astype(np.float32)
@@ -251,12 +285,35 @@ class ModeBank:
         E = E + self.bowl
         GX = GX + self.bgx; GY = GY + self.bgy
         if rc > 1e-3:
+            # SHAPED BY cos^2(m*theta), NOT UNIFORM. The first version added the
+            # same agitation everywhere inside the dead zone. That stops the flat
+            # disc filling with a blob of sand, but a uniform push cannot tell a
+            # nodal diameter from the space between two of them, so it swept the
+            # lines out along with the mush. Rendered on a (2,1) figure, the two
+            # diameters stopped short around an empty disc instead of crossing --
+            # the "donut hole" the comment above warned about, produced by the
+            # remedy for the blob. Weighting the bump by the angular factor
+            # agitates only BETWEEN the diameters, where cos^2 is large, and
+            # leaves the diameters themselves at zero, so sand is driven onto
+            # them and they run through the centre and cross.
+            #
+            # AND ONLY THE TANGENTIAL HALF OF ITS GRADIENT. The gradient of
+            # core(r)*ang(theta) is core*grad(ang) + ang*grad(core) by the product
+            # rule. The first term runs along circles toward the diameters, which
+            # is the point. The second is RADIAL, and because core falls with r it
+            # points outward everywhere ang > 0 -- so it expelled sand from the
+            # whole dead zone, diameters included. Measured on a pure (2,1) field
+            # after 700 steps: 0 grains inside r=0.05, a ring at 6.76x uniform
+            # density exactly where the core ends (r_c=0.121), and an outward
+            # drift of +0.68 ON the nodal diagonal at r=0.02. Making the bump
+            # angular did nothing on its own because this term survived it; the
+            # first version (isotropic) had the same term with ang=1 everywhere.
             core = np.clip(1.0 - self.rnorm / np.float32(rc), 0.0, 1.0)
             core *= core
-            E = E + core * np.float32(0.05)
-            cgy, cgx = np.gradient(core.reshape(self.ph, self.pw))
-            GX = GX + cgx.reshape(-1) * np.float32(0.05)
-            GY = GY + cgy.reshape(-1) * np.float32(0.05)
+            k = core * np.float32(0.10)
+            E = E + k * (a2 @ self.ANG)
+            GX = GX + k * (a2 @ self.AGX)
+            GY = GY + k * (a2 @ self.AGY)
         np.clip(E, 0.0, 1.0, out=E)
         # Normalise the drift by a high percentile, not the max: a few very steep
         # cells on the u^2 ridges would otherwise scale every gentle long-range
@@ -1160,8 +1217,17 @@ def detect_refresh(default=60.0):
         r = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True,
                            text=True, timeout=3)
         if r.returncode == 0:
-            best = max((float(m.get("refreshRate") or 0)
-                        for m in json.loads(r.stdout)), default=0.0)
+            mons = json.loads(r.stdout)
+            # THE MONITOR IT IS SHOWING ON, NOT THE FASTEST ONE ATTACHED. This
+            # took the maximum across all outputs, which was the same answer
+            # until an external 239.757Hz display was plugged in next to the
+            # 120Hz panel -- then the screensaver targeted 240 on a panel that
+            # cannot show it, and the loop stopped sleeping between frames to
+            # chase a rate no one would see. The screensaver opens on the
+            # focused output, so that is the one whose rate matters.
+            focused = [m for m in mons if m.get("focused")]
+            pick = focused or mons
+            best = max((float(m.get("refreshRate") or 0) for m in pick), default=0.0)
             if 20.0 <= best <= 480.0:
                 return best
     except (OSError, ValueError, subprocess.SubprocessError):
