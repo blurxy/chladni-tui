@@ -102,9 +102,8 @@ while true; do
     if [[ -t 0 ]]; then
       # A keypress ends it. read blocks for up to a second, so this loop costs
       # nothing while idle.
-      if read -r -n1 -t 1 || ! screensaver_in_focus; then
-        exit_screensaver
-      fi
+      sleep 1
+      screensaver_in_focus || exit_screensaver
     else
       # stdin is not a live terminal (piped, closed, or detached). read would
       # then fail INSTANTLY rather than waiting its timeout, turning this into a

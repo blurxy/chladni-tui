@@ -15,6 +15,7 @@ invent interference nodes no real plate has.
 """
 import os
 import random, sys, time, math, signal, argparse, json, glob, struct, fcntl, termios
+import select, tty
 import shutil, subprocess
 
 # BLAS THREAD COUNT IS A HEAT-VERSUS-SMOOTHNESS TRADE, measured live on a 240Hz
@@ -54,7 +55,72 @@ def _on_external_power(root="/sys/class/power_supply"):
     return not has_battery                          # no battery at all: a desktop
 
 
-_THREADS = "2" if _on_external_power() else "1"
+# ---------------------------------------------------------------- settings ---
+# Everything adjustable lives here and is edited from INSIDE the running program
+# (press `s`), not from a config file and not by editing the source. The file is
+# only where the choices persist between runs.
+#
+# Loaded before numpy is imported, because the thread count has to be in the
+# environment before the BLAS library reads it -- after that it is fixed for the
+# life of the process, which is why "performance" is the one setting that says
+# it takes effect at the next launch.
+SETTINGS_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "chladni-tui", "settings.json")
+
+DEFAULTS = {
+    "fps": "auto",          # auto = the focused monitor's refresh rate
+    "threads": "auto",      # auto = 2 plugged in, 1 on battery
+    "detail": 8,            # terminal font size: smaller cell, finer plate
+    "grains": "auto",
+    "volume": 0.55,
+    "subtitles": True,
+    "panels": True,
+    "tint": 0.22,
+    "gap": 1.5,
+}
+
+
+def load_settings(path=SETTINGS_PATH):
+    """Saved choices, falling back to defaults for anything missing or broken.
+
+    Never raises: a corrupt settings file must not stop a screensaver from
+    starting. Unknown keys are dropped rather than carried, so an older file
+    cannot smuggle a setting this version no longer understands.
+    """
+    out = dict(DEFAULTS)
+    try:
+        with open(path) as fh:
+            saved = json.load(fh)
+        if isinstance(saved, dict):
+            for k, v in saved.items():
+                if k in DEFAULTS and type(v) is type(DEFAULTS[k]) or k in ("fps", "threads", "grains"):
+                    out[k] = v
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def save_settings(cfg, path=SETTINGS_PATH):
+    """Persist atomically; a half-written settings file is worse than none."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = "%s.%d" % (path, os.getpid())
+        with open(tmp, "w") as fh:
+            json.dump({k: cfg[k] for k in DEFAULTS if k in cfg}, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+SETTINGS = load_settings()
+
+_want = SETTINGS.get("threads", "auto")
+if _want in (1, 2, 4, "1", "2", "4"):
+    _THREADS = str(_want)
+else:
+    _THREADS = "2" if _on_external_power() else "1"
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
            "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
     os.environ.setdefault(_v, _THREADS)
@@ -86,13 +152,14 @@ SAND_STOPS = [(0.00, (0x15, 0x1a, 0x1f)), (0.06, (0x1b, 0x33, 0x4e)),
               (1.00, (0xff, 0xf8, 0xec))]
 NLEV = 14                      # more steps now that the ramp has somewhere to go
 CHROME = {
-    "rule":   (0x2b, 0x36, 0x40),
-    "label":  (0x5d, 0x74, 0x86),
+    # raised: at these sizes the old greys (0x2b/0x5d) were unreadable over the wash
+    "rule":   (0x3d, 0x4b, 0x57),
+    "label":  (0x82, 0x99, 0xab),
     "value":  (0xc4, 0xd4, 0xe2),
     "accent": (0xe0, 0xb2, 0x62),
     "arch":   (0x59, 0x9c, 0xd6),
     "bright": (0xed, 0xf1, 0xf5),
-    "dim":    (0x3a, 0x48, 0x54),
+    "dim":    (0x66, 0x78, 0x86),
 }
 CK = list(CHROME)
 C = {k: NLEV + i for i, k in enumerate(CK)}
@@ -1243,7 +1310,7 @@ def draw(chrome, st):
     note = ("E = \u03a3 a\u1d62\u00b2 U\u1d62\u00b2   \u00b7   incoherent sum: sand rests only where every driven "
             "mode is quiet   \u00b7   clamped membrane, not a free-edge plate")
     ch.put(br + 2, max(2, (cols - len(note)) // 2), note[:cols - 4], D)
-    hint = "any key exits"
+    hint = "s settings \u00b7 i what is this \u00b7 any key exits"
     ch.put(br + 3, cols - 2 - len(hint), hint, D)
 
 
@@ -1480,6 +1547,200 @@ def synth_timeline(nm, fps=24.0, secs=90.0):
                       "surah_no": 0, "revelation": "\u2014", "n_ayat": 0}], "fatiha": []}
 
 
+# ------------------------------------------------------------------- menu ---
+DEFAULT_VOLUME = 0.55
+DEFAULT_GAP = 2.5
+
+MENU_ITEMS = [
+    ("fps",       "frame rate",   ["auto", 30, 60, 120, 240],  "live"),
+    ("threads",   "performance",  ["auto", 1, 2, 4],           "next launch"),
+    ("detail",    "detail",       [6, 8, 11, 14],              "next launch"),
+    ("grains",    "sand",         ["auto", 0.5, 1.0, 2.0],     "live"),
+    ("volume",    "volume",       [0.0, 0.25, 0.4, 0.55, 0.75, 1.0], "next recitation"),
+    ("tint",      "tint",         [0.0, 0.12, 0.22, 0.4],      "live"),
+    ("gap",       "gap",          [0.0, 1.5, 3.0, 6.0],        "live"),
+    ("subtitles", "subtitles",    [True, False],               "live"),
+    ("panels",    "panels",       [True, False],               "live"),
+]
+
+MENU_HELP = {
+    "fps":       "frames per second. auto follows this monitor's refresh rate",
+    "threads":   "more threads: smoother, much hotter. auto = 2 on mains, 1 on battery",
+    "detail":    "terminal font size. smaller cell = finer plate, more work per frame",
+    "grains":    "how much sand. auto scales with the plate",
+    "volume":    "recitation volume",
+    "tint":      "how far the palette turns with each reciter. 0 keeps one palette",
+    "gap":       "seconds of quiet between recitations",
+    "subtitles": "the ayah, its transliteration and its meaning",
+    "panels":    "the side panels and the dashboard",
+}
+
+
+def fmt_val(v):
+    if v is True:
+        return "on"
+    if v is False:
+        return "off"
+    if isinstance(v, float):
+        return ("%.2f" % v).rstrip("0").rstrip(".")
+    return str(v)
+
+
+class Menu:
+    """The settings overlay. Every adjustable thing lives here.
+
+    The point is that nothing needs a config file or a rebuild: this is the only
+    place the program is configured, it writes its own settings, and it says
+    per-row whether a change is live or waits for the next launch -- because a
+    couple genuinely cannot change in a running process (the BLAS thread count is
+    read once at import, and the terminal's font size belongs to the terminal).
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.i = 0
+        self.open = False
+        self.note = ""
+
+    def cur_key(self):
+        return MENU_ITEMS[self.i][0]
+
+    def move(self, d):
+        self.i = (self.i + d) % len(MENU_ITEMS)
+
+    def cycle(self, d):
+        key, _label, values, scope = MENU_ITEMS[self.i]
+        cur = self.cfg.get(key, DEFAULTS[key])
+        try:
+            j = values.index(cur)
+        except ValueError:
+            j = 0
+        self.cfg[key] = values[(j + d) % len(values)]
+        ok = save_settings(self.cfg)
+        self.note = ("%s = %s  (%s)" % (_label, fmt_val(self.cfg[key]), scope)
+                     if ok else "could not write %s" % SETTINGS_PATH)
+        return key, self.cfg[key], scope
+
+
+def draw_menu(ch, menu, cols, rows, C):
+    """Draw the overlay. Sized to its content, centred, over the plate."""
+    w = min(cols - 6, 72)
+    h = len(MENU_ITEMS) + 7
+    r0 = max(1, (rows - h) // 2)
+    c0 = max(2, (cols - w) // 2)
+    ch.panel(r0, c0, w, h, "SETTINGS", C["rule"], C["accent"])
+    for n, (key, label, values, scope) in enumerate(MENU_ITEMS):
+        r = r0 + 2 + n
+        sel = (n == menu.i)
+        val = fmt_val(menu.cfg.get(key, DEFAULTS[key]))
+        ch.put(r, c0 + 2, ("\u25b8 " if sel else "  ") + label,
+               C["bright"] if sel else C["label"])
+        # value right-aligned in its own column; scope sits left of it, never over it
+        vw = max(len(fmt_val(v)) for _k, _l, vs, _s in MENU_ITEMS for v in vs)
+        ch.put(r, c0 + w - 3 - len(val), val, C["accent"] if sel else C["value"])
+        if scope != "live":
+            ch.put(r, c0 + w - 5 - vw - len(scope), scope, C["dim"])
+    ch.put(r0 + h - 4, c0 + 2, MENU_HELP.get(menu.cur_key(), "")[:w - 4], C["dim"])
+    if menu.note:
+        ch.put(r0 + h - 3, c0 + 2, menu.note[:w - 4], C["value"])
+    ch.put(r0 + h - 2, c0 + 2,
+           "up/down choose \u00b7 left/right change \u00b7 s or esc close \u00b7 q quit"[:w - 4],
+           C["label"])
+
+
+INFO = [
+    ("What this is", [
+        "A recitation of the Qur'an -- the scripture of Islam -- driving a physics simulation.",
+        "Sand on a vibrating plate gathers where the plate is still. Pitch decides the pattern;",
+        "these are the real standing waves of a circular drum skin, not an animation.",
+    ]),
+    ("Top left", [
+        "The reciter, and which of the Qur'an's 114 chapters (a surah) is being read.",
+        "Meccan or Medinan says which period of the revelation it belongs to.",
+    ]),
+    ("Under the plate", [
+        "89 : 8   of 30   is chapter 89, verse 8, of that chapter's 30 verses. A verse is an ayah.",
+        "Middle line: the Arabic sounds written in Latin letters. Read it aloud --",
+        "a, i and u with a bar over them are held long.",
+        "Bottom line: what it means, in Muhammad Asad's English translation.",
+    ]),
+    ("Right", [
+        "FIGURE names the standing wave: (2,2) is 2 nodal diameters -- so 4 spokes -- and 1 ring.",
+        "J is a Bessel function, the mathematics of how a circular membrane vibrates.",
+        "MODE LADDER is how strongly the voice is exciting each shape right now.",
+        "PLATE is the simulation itself; drive, bottom left, is how loud the voice is.",
+    ]),
+]
+
+
+def draw_info(ch, cols, rows, C):
+    """Plain-English guide to the screen, for a viewer who knows none of this."""
+    body = [ln for _title, lines in INFO for ln in ([""] + lines)]
+    w = min(cols - 6, max(len(l) for l in body) + 6)
+    h = len(body) + len(INFO) + 5
+    r0 = max(1, (rows - h) // 2)
+    c0 = max(2, (cols - w) // 2)
+    ch.panel(r0, c0, w, h, "WHAT AM I LOOKING AT", C["rule"], C["accent"])
+    r = r0 + 2
+    for title, lines in INFO:
+        ch.put(r, c0 + 2, title, C["accent"]); r += 1
+        for ln in lines:
+            ch.put(r, c0 + 2, ln[:w - 4], C["value"]); r += 1
+        r += 1
+    ch.put(r0 + h - 2, c0 + 2, "i closes this \u00b7 s settings \u00b7 any other key exits", C["label"])
+
+
+_tty_saved = None
+
+
+def keyboard(on=True):
+    """Own the keyboard, so the settings menu can exist at all.
+
+    A screensaver exits on any key, and that check used to live in the launcher
+    script -- which meant the renderer never saw a keystroke and could not offer
+    anything but exiting. Now the renderer reads the keys and keeps the same
+    contract: any key still quits, except the ones that open and drive the menu.
+    Restored on every exit path; a terminal left in cbreak mode is a broken shell.
+    """
+    global _tty_saved
+    try:
+        fd = sys.stdin.fileno()
+        if on:
+            if _tty_saved is None and os.isatty(fd):
+                _tty_saved = termios.tcgetattr(fd)
+                tty.setcbreak(fd, termios.TCSANOW)   # TCSAFLUSH would discard keys typed during startup
+        elif _tty_saved is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, _tty_saved)
+            _tty_saved = None
+    except (OSError, termios.error, ValueError):
+        _tty_saved = None
+
+
+def read_keys():
+    """Whatever is waiting on stdin, as tokens. Never blocks."""
+    try:
+        fd = sys.stdin.fileno()
+        if not os.isatty(fd):
+            return []
+        if not select.select([fd], [], [], 0)[0]:
+            return []
+        data = os.read(fd, 64).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return []
+    keys, i = [], 0
+    while i < len(data):
+        c = data[i]
+        if c == "\x1b" and data[i + 1:i + 2] == "[":
+            code = data[i + 2:i + 3]
+            keys.append({"A": "up", "B": "down", "C": "right", "D": "left"}.get(code, "esc"))
+            i += 3
+        elif c == "\x1b":
+            keys.append("esc"); i += 1
+        else:
+            keys.append(c); i += 1
+    return keys
+
+
 def main():
     launched_at = time.time()
     ap = argparse.ArgumentParser()
@@ -1497,12 +1758,23 @@ def main():
     ap.add_argument("--aspect", type=float, default=0.0, help="override sub-dot h/w")
     ap.add_argument("--rim", type=float, default=0.17, help="how hard the clamped rim is swept")
     ap.add_argument("--select", type=float, default=6.0, help="mode selectivity")
-    ap.add_argument("--volume", type=float, default=0.55, help="recitation volume 0-1")
+    ap.add_argument("--volume", type=float, default=DEFAULT_VOLUME, help="recitation volume 0-1")
     ap.add_argument("--silent", action="store_true", help="do not play the recitation")
-    ap.add_argument("--gap", type=float, default=2.5, help="seconds of quiet between reciters")
+    ap.add_argument("--gap", type=float, default=DEFAULT_GAP, help="seconds of quiet between reciters")
     args = ap.parse_args()
+    keyboard(True)                 # before the timeline load, so early keys are not lost
+    # settings file supplies anything not given on the command line
     if args.fps <= 0:
-        args.fps = detect_refresh()
+        want_fps = SETTINGS.get("fps", "auto")
+        args.fps = detect_refresh() if want_fps == "auto" else float(want_fps)
+    if SETTINGS.get("panels") is False:
+        args.no_chrome = True
+    if args.gap == DEFAULT_GAP:
+        args.gap = float(SETTINGS.get("gap", DEFAULT_GAP))
+    if args.volume == DEFAULT_VOLUME:
+        args.volume = float(SETTINGS.get("volume", DEFAULT_VOLUME))
+    menu = Menu(SETTINGS)
+    info_open = False
 
     if args.size:
         cols, rows = (int(v) for v in args.size.lower().split("x"))
@@ -1746,13 +2018,64 @@ def main():
             sand.dts = float(np.clip(_dt * Sand.REF_FPS, 0.10, 2.0))
             sand.step(E, GX, GY, agit)
             ch, lvv, bgv = scr.compose(sand, gain)
-            if not args.no_chrome:
-                draw(chrome, state(gi % total, amps, (sel.cur,)))
+            for k in read_keys():
+                if info_open and k != "i":
+                    info_open = False
+                    if k in ("s", ","):
+                        menu.open = True
+                    elif k not in ("esc",):
+                        RUN["go"] = False
+                elif menu.open:
+                    if k in ("up", "down"):
+                        menu.move(-1 if k == "up" else 1)
+                    elif k in ("left", "right"):
+                        key, val, scope = menu.cycle(-1 if k == "left" else 1)
+                        if key == "fps":
+                            args.fps = detect_refresh() if val == "auto" else float(val)
+                        elif key == "gap":
+                            args.gap = float(val)
+                        elif key == "panels":
+                            args.no_chrome = not val
+                        elif key == "volume":
+                            audio.volume = float(val)
+                        elif key == "grains":
+                            n = (args.grains or int(np.clip(subw * subh * 0.55, 45000, 300000))
+                                 if val == "auto" else int(np.clip(subw * subh * 0.55 * float(val),
+                                                                   5000, 400000)))
+                            sand.resize(n); ngrain = n
+                            gain = 1.0 / max(3.0, ngrain / float(cols * rows) * 4.5)
+                    elif k in ("s", "esc", ","):
+                        menu.open = False
+                    elif k == "q":
+                        RUN["go"] = False
+                elif k in ("s", ","):
+                    menu.open = True; info_open = False
+                elif k == "i":
+                    info_open = not info_open
+                else:
+                    RUN["go"] = False          # screensaver contract: any other key exits
+            if not args.no_chrome or menu.open or info_open:
+                if not args.no_chrome:
+                    draw(chrome, state(gi % total, amps, (sel.cur,)))
+                if menu.open:
+                    draw_menu(chrome, menu, cols, rows, C)
+                elif info_open:
+                    draw_info(chrome, cols, rows, C)
                 ch, lvv, bgv = chrome.composite(ch, lvv, bgv)
             # Retint when the held figure changes. The lookup table is shared by
             # every cell, so changing it invalidates the whole diff -- force one
             # full repaint rather than let stale colours linger.
-            want = float(MODE_HUE[sel.cur % len(MODE_HUE)]) * 0.5
+            # TINT PER RECITATION, NOT PER FIGURE, and gently. Keyed to the
+            # figure this rotated the whole palette every time the figure
+            # changed -- which after the schedule was tightened is every 1.08s
+            # (median) -- so the plate strobed through hues and, worse, every
+            # retint invalidates the shared lookup table and forces a FULL
+            # repaint: roughly one complete redraw per second, against a byte
+            # budget the rest of the renderer works hard to keep at 0.12 MB/s.
+            # At half amplitude it also reached magenta and acid green, which is
+            # not a colour this plate has. Per track it changes when the voice
+            # does, which is what a viewer reads as "a new recitation".
+            want = float(MODE_HUE[track % len(MODE_HUE)]) * float(SETTINGS.get("tint", 0.22))
             if cur_hue is None or abs(want - cur_hue) > 1e-6:
                 cur_hue = want
                 globals()["LUT"] = build_lut(cur_hue)
@@ -1839,6 +2162,7 @@ def main():
                 started = time.time(); frame = 0
     finally:
         audio.stop()
+        keyboard(False)
         sys.stdout.write("\033[0m\033[?25h\033[2J\033[H"); sys.stdout.flush()
     return 0
 
