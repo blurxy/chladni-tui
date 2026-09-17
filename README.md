@@ -169,6 +169,19 @@ zero, so **20.7%** of the canvas stayed lit with trails of sand that had long si
 left. `--dump` never showed any of this because it draws once, from a fresh
 buffer. Lit area over real playback is now 6.1%.
 
+**Figure lines read cold, and the obvious fix made them colder.** A cell on a
+nodal line averaged level 5.6 of 13 — exactly where the ramp turns from teal to
+gold — so live figures looked washed out beside the settled stills. The suspect
+was the brightness reference: it is the 99th percentile of every cell holding any
+density, so the caked rim sets the exposure for the whole plate. Measured over 15 s
+of real playback, all three ways of narrowing that reference made lines *dimmer*
+(6.4 → 5.8 → 5.5), because the faint cells being excluded were the ones holding
+the percentile down. The curve was the lever, not the reference: widening the
+log's span and easing it lifts line cells to 7.2 and doubles the share of lit
+cells in the warm half, while pure white stays at 2.6% — a lower percentile
+reached 8.9 but put 11% of lit cells on white, and white is the only level that
+says *crossing* rather than *bright*.
+
 **Every visual check was of the wrong program.** The screenshots were real,
 correctly captured, and of a stale window: `setsid foot &` returns a PID that is
 not the window's process, so killing it never closed the previous instance, the
