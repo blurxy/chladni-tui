@@ -6,7 +6,7 @@ user's live desktop, and a screensaver window exits the moment he touches the
 keyboard. Since we emit the escape sequences ourselves we can just draw them:
 same font, same cell metrics, same palette. Offline, repeatable, invisible.
 """
-import sys, re, argparse
+import re, argparse
 from PIL import Image, ImageDraw, ImageFont
 
 FONT = "/usr/share/fonts/TTF/IosevkaNerdFontMono-Regular.ttf"

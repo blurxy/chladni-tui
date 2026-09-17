@@ -20,6 +20,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SGR = re.compile(r"\x1b\[([0-9;]*)m")
+# glyph -> (how to draw, stroke thickness as a fraction of the cell)
+BOXES = {"─": ("h", 0.07), "━": ("h", 0.17), "│": ("v", 0.09),
+         "┃": ("v", 0.22), "█": ("f", 1.0), "▮": ("t", 0),
+         "▯": ("o", 0)}
 OTHER = re.compile(r"\x1b(\[[0-9;?]*[A-Za-z]|\][^\x07]*\x07)")
 
 
@@ -87,6 +91,30 @@ def paint(text, cols, rows, cw, chh, font):
             if bg is not None:
                 d.rectangle([x0, y0, x0 + cw - 1, y0 + chh - 1], fill=bg)
             o = ord(ch)
+            if ch in BOXES:
+                # DRAW BOX AND BLOCK GLYPHS GEOMETRICALLY, NOT FROM THE FONT.
+                # PIL places each glyph at its own advance width, which for
+                # these is narrower than the cell -- so a run of U+2501 came out
+                # as a dashed line and I nearly "fixed" a bar that is solid in
+                # every terminal. A terminal tiles these edge to edge; so does
+                # this now.
+                kind, frac = BOXES[ch]
+                if kind == "h":
+                    t = max(1.0, chh * frac)
+                    d.rectangle([x0, y0 + (chh - t) / 2, x0 + cw, y0 + (chh + t) / 2], fill=fg)
+                elif kind == "v":
+                    t = max(1.0, cw * frac)
+                    d.rectangle([x0 + (cw - t) / 2, y0, x0 + (cw + t) / 2, y0 + chh], fill=fg)
+                elif kind == "f":
+                    d.rectangle([x0, y0, x0 + cw, y0 + chh], fill=fg)
+                elif kind == "t":      # tally: filled tall block, inset
+                    d.rectangle([x0 + cw * 0.18, y0 + chh * 0.22,
+                                 x0 + cw * 0.82, y0 + chh * 0.78], fill=fg)
+                else:                  # "o": hollow tally
+                    d.rectangle([x0 + cw * 0.18, y0 + chh * 0.22,
+                                 x0 + cw * 0.82, y0 + chh * 0.78], outline=fg)
+                c += 1
+                continue
             if 0x2800 < o <= 0x28FF:
                 bits = o - 0x2800
                 for b, (bx, by) in enumerate(BITS):

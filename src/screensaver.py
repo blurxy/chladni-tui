@@ -15,28 +15,16 @@ invent interference nodes no real plate has.
 """
 import os
 import random, sys, time, math, signal, argparse, json, glob, struct, fcntl, termios
-import select, tty
+import atexit, select, tty
 import shutil, subprocess
 
-# BLAS THREAD COUNT IS A HEAT-VERSUS-SMOOTHNESS TRADE, measured live on a 240Hz
-# monitor at 1920x1080 (65,102 grains), one short run each, so read the thermals
-# as indicative -- two lab VMs were running alongside:
-#
-#     threads  --fps   achieved   renderer CPU   package temp     throttle events
-#        1     auto       43 fps        97%      48C avg, 66 peak        0
-#        2      60        58 fps       161%      78C avg, 85 peak        0
-#        2     auto      100 fps         -       82C avg, 100 peak     523
-#        4      60        60 fps       330%        ~95 peak             16
-#        4     auto      115 fps       390%       ~100               ~700 in 40s
-#
-# A headless benchmark of physics and compositing alone said four threads were no
-# faster than one (5.9 vs 6.1 ms/frame). That was true of what it timed and
-# wrong about the live loop, which also builds and writes the frame.
-#
-# So the default follows the power source: plugged in, 2 threads for the fluid
-# end of the table; on battery, 1 thread, because a screensaver runs while nobody
-# is watching and on battery its heat is also charge. Override per launch with
-# OPENBLAS_NUM_THREADS.
+# BLAS THREAD COUNT TRADES HEAT FOR SMOOTHNESS. Measured on a 240Hz panel at
+# 1920x1080: 1 thread 43fps at 48C with no throttling; 2 threads 58fps at 78C;
+# 4 threads 115fps and ~700 throttle events in 40s. A headless benchmark of the
+# physics alone said 4 threads were no faster than 1 -- true of what it timed
+# and wrong about the live loop, which also builds and writes the frame.
+# So the default follows the power source: 2 plugged in, 1 on battery, where a
+# screensaver's heat is also charge. Override with OPENBLAS_NUM_THREADS.
 def _on_external_power(root="/sys/class/power_supply"):
     supplies = glob.glob(os.path.join(root, "*"))
     has_battery = False
@@ -56,14 +44,10 @@ def _on_external_power(root="/sys/class/power_supply"):
 
 
 # ---------------------------------------------------------------- settings ---
-# Everything adjustable lives here and is edited from INSIDE the running program
-# (press `s`), not from a config file and not by editing the source. The file is
-# only where the choices persist between runs.
-#
-# Loaded before numpy is imported, because the thread count has to be in the
-# environment before the BLAS library reads it -- after that it is fixed for the
-# life of the process, which is why "performance" is the one setting that says
-# it takes effect at the next launch.
+# Edited from inside the running program (press `s`); the file only persists
+# the choices between runs. Loaded before numpy, because the BLAS thread count
+# must be in the environment before the library reads it -- which is why
+# "performance" is the one setting that takes effect at the next launch.
 SETTINGS_PATH = os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
     "chladni-tui", "settings.json")
@@ -75,9 +59,10 @@ DEFAULTS = {
     "grains": "auto",
     "volume": 0.55,
     "subtitles": True,
-    "panels": True,
+    "panels": "focus",   # focus | full | off
     "tint": 0.22,
     "gap": 1.5,
+    "wash": 0.55,      # membrane glow under the sand; 0 = sand only
 }
 
 
@@ -135,16 +120,11 @@ AUDIO_DIR = os.path.join(HERE, "audio")
 # The steel ramp the cymatics wallpapers were rendered in, so the screensaver
 # and the desktop behind it are the same picture.
 GROUND = (0x15, 0x1a, 0x1f)
-# A real ramp, not a grey one. Sand density now runs deep blue -> teal -> cyan
-# -> gold -> warm white, so the halo around every nodal line resolves as colour
-# instead of five shades of the background. Measured before this change, the two
-# commonest colours in a frame were the background and the panel rule.
-# THE RAMP WAS NEVER THE PROBLEM; NOTHING REACHED IT. Measured from a real
-# frame: the plate rendered almost entirely in the two darkest stops, with the
-# warm end unused, because a settled nodal line's density sits near the middle
-# of the normalised range and the stops put colour in the top third. Pulling the
-# warm stops down means a line that has actually settled reads as gold instead
-# of as the second-darkest blue -- which is the whole point of a ramp.
+# Sand density runs deep blue -> teal -> cyan -> gold -> warm white, so the
+# halo around a nodal line resolves as colour rather than five shades of
+# background. The warm stops sit LOW on purpose: a settled line's density
+# lands mid-range, so stops placed in the top third left the warm end unused
+# and every figure read cold.
 SAND_STOPS = [(0.00, (0x15, 0x1a, 0x1f)), (0.06, (0x1b, 0x33, 0x4e)),
               (0.14, (0x22, 0x5c, 0x85)), (0.24, (0x2b, 0x96, 0xae)),
               (0.36, (0x58, 0xc9, 0xc2)), (0.50, (0x9a, 0xdc, 0x9b)),
@@ -163,18 +143,12 @@ CHROME = {
 }
 CK = list(CHROME)
 C = {k: NLEV + i for i, k in enumerate(CK)}
-# The plate is vibrating everywhere the sand is not, and that was drawn as bare
-# background. A very dark wash of the driving energy fills the disc without ever
-# competing with settled sand -- index 0 is the terminal's own background, so a
-# quiet cell costs 5 bytes (\033[49m), not a 19-byte truecolour escape.
-# THE PLATE BODY READ AS NEAR-BLACK. This wash is the vibrating membrane where
-# no sand has settled -- most of the disc, most of the time -- and it topped out
-# at #223142, about 6% off the background. So the picture was a bright figure on
-# a void rather than sand on a plate, and the disc's edge was invisible except
-# where the ring was drawn. Raised and warmed toward the sand ramp's blue so the
-# membrane reads as a lit surface, while still sitting clearly BELOW the lowest
-# sand level -- a quiet cell must never compete with a settled one, which is the
-# constraint that kept this dark in the first place.
+# The membrane vibrates everywhere the sand is not; drawn as bare background
+# it read as a void with a figure floating on it and the disc edge invisible.
+# This wash fills the disc, warmed toward the sand ramp's blue so it reads as
+# a lit surface -- but always BELOW the lowest sand level, so a quiet cell can
+# never compete with a settled one. Index 0 is the terminal's own background,
+# so a quiet cell costs 5 bytes, not 19.
 BG_STOPS = [(0.00, GROUND), (0.30, (0x1c, 0x26, 0x33)),
             (0.60, (0x24, 0x35, 0x49)), (0.85, (0x2c, 0x44, 0x5f)),
             (1.00, (0x35, 0x53, 0x72))]
@@ -218,7 +192,6 @@ MODE_HUE = ((np.arange(64, dtype=np.float64) * 0.381966) % 1.0) - 0.5
 
 BRAILLE = np.array([chr(0x2800 + i) for i in range(256)], dtype="<U1")
 DOTW = np.array([[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]], dtype=np.uint16)
-BARS = " ▁▂▃▄▅▆▇█"
 ARCH_GLYPH = ""          # nf-linux-archlinux
 
 # A braille sub-dot is 2 wide x 4 tall inside one cell, so it is square only if
@@ -297,24 +270,16 @@ class ModeBank:
                     rc = float(rad_bins[b - 1]); break
             self.r_core[i] = rc
         # EACH MODE'S ANGULAR FACTOR, cos^2(m*theta), for shaping the centre.
-        # J_m(alpha*r) fades as r^m toward the middle, but cos(m*theta) does not
-        # fade at all: it is exactly zero on the m nodal diameters at EVERY
-        # radius. So the diameters still exist inside the dead zone even though
-        # the full field has flattened to nothing there -- they are just invisible
-        # to anything that only looks at magnitude.
-        # Its gradient is TANGENTIAL -- cos^2(m*theta) does not vary with r -- so
-        # -grad runs along circles toward the nearest nodal diameter and never
-        # outward. COMPUTED ANALYTICALLY, NOT WITH np.gradient: finite differences
-        # of a polar pattern sampled on a Cartesian grid leak small RADIAL
-        # components, and a small outward drift repeated over hundreds of steps
-        # still empties the core. Measured with np.gradient on a (4,1) field: no
-        # sand inside r=0.10 and +0.03 of outward drift sitting on the nodal
-        # diameter itself. "Purely tangential" was true of the maths and false of
-        # the discretisation. Here it is true by construction:
+        # J_m fades as r^m toward the middle but cos(m*theta) does not: it is exactly
+        # zero on the m nodal diameters at every radius, so the diameters survive
+        # inside the dead zone where the full field has flattened to nothing.
+        # Its gradient is purely tangential. COMPUTED ANALYTICALLY -- np.gradient on a
+        # polar pattern sampled on a Cartesian grid leaks a small RADIAL component,
+        # and a small outward drift repeated over hundreds of steps empties the core
+        # (measured: no sand inside r=0.10). Here it is true by construction:
         #     grad f = (1/r)(df/dtheta) theta_hat,  df/dtheta = -m sin(2 m theta)
-        # in plate units, divided by rad for per-pixel units like every other
-        # field. Faded to zero within a few sub-dots of the origin, where theta
-        # changes by more than a mode's lobe per pixel and is not resolvable.
+        # in plate units, divided by rad. Faded to zero near the origin, where theta
+        # is not resolvable per pixel.
         rpx = r * np.float32(rad)
         fade = np.clip((rpx - 2.0) / 3.0, 0.0, 1.0).astype(np.float32)
         safe_r = np.maximum(r, np.float32(1e-6))
@@ -390,29 +355,16 @@ class ModeBank:
         E = E + self.bowl
         GX = GX + self.bgx; GY = GY + self.bgy
         if rc > 1e-3:
-            # SHAPED BY cos^2(m*theta), NOT UNIFORM. The first version added the
-            # same agitation everywhere inside the dead zone. That stops the flat
-            # disc filling with a blob of sand, but a uniform push cannot tell a
-            # nodal diameter from the space between two of them, so it swept the
-            # lines out along with the mush. Rendered on a (2,1) figure, the two
-            # diameters stopped short around an empty disc instead of crossing --
-            # the "donut hole" the comment above warned about, produced by the
-            # remedy for the blob. Weighting the bump by the angular factor
-            # agitates only BETWEEN the diameters, where cos^2 is large, and
-            # leaves the diameters themselves at zero, so sand is driven onto
-            # them and they run through the centre and cross.
-            #
-            # AND ONLY THE TANGENTIAL HALF OF ITS GRADIENT. The gradient of
-            # core(r)*ang(theta) is core*grad(ang) + ang*grad(core) by the product
-            # rule. The first term runs along circles toward the diameters, which
-            # is the point. The second is RADIAL, and because core falls with r it
-            # points outward everywhere ang > 0 -- so it expelled sand from the
-            # whole dead zone, diameters included. Measured on a pure (2,1) field
-            # after 700 steps: 0 grains inside r=0.05, a ring at 6.76x uniform
-            # density exactly where the core ends (r_c=0.121), and an outward
-            # drift of +0.68 ON the nodal diagonal at r=0.02. Making the bump
-            # angular did nothing on its own because this term survived it; the
-            # first version (isotropic) had the same term with ang=1 everywhere.
+            # SHAPED BY cos^2(m*theta), AND ONLY ITS TANGENTIAL HALF. A uniform push into
+            # the dead zone cannot tell a nodal diameter from the gap between two, so it
+            # swept the lines out along with the blob it was meant to clear. Weighting by
+            # the angular factor agitates only BETWEEN the diameters and leaves them at
+            # zero, driving sand onto them so they cross the centre.
+            # The product rule puts a RADIAL term in grad(core*ang) pointing outward
+            # wherever ang > 0, which expelled sand from the whole dead zone, diameters
+            # included -- so making the bump angular did nothing until this term was
+            # dropped. Measured with it: 0 grains inside r=0.05 and a 6.8x density ring
+            # exactly where the core ends.
             core = np.clip(1.0 - self.rnorm / np.float32(rc), 0.0, 1.0)
             core *= core
             k = core * np.float32(0.10)
@@ -442,16 +394,11 @@ class FigurePlayer:
     the live selector was.
     """
 
-    # FADE 0.35s, AND MEASURED IN REAL SECONDS. Two modes blended have zeros
-    # only where BOTH vanish, which is a set of POINTS -- so during a crossfade
-    # the sand beads into dots instead of drawing lines. That is fine for a moment
-    # and ruinous as a steady state, which is what it became: figures change
-    # every 1.08s (median), the fade was 1.0s, and it was counted in frames at
-    # the TARGET rate (240 on a 240Hz monitor) while the renderer ran at 115,
-    # stretching it to 2.1s real. Measured against the schedule, the plate showed
-    # a blend 75% of the time -- a live screen of scattered dots, which is exactly
-    # what "it doesn't look like the reel" was describing. At 0.35s of real time
-    # it is 19%.
+    # FADE 0.35s, IN REAL SECONDS. Two blended modes share zeros only at POINTS, so
+    # a crossfade beads the sand into dots instead of lines -- fine for a moment,
+    # ruinous as a steady state. Figures change every 1.08s (median), so a 1.0s
+    # fade counted in frames at the TARGET rate stretched to 2.1s real and the
+    # plate showed a blend 75% of the time. At 0.35s real it is 19%.
     def __init__(self, nm, fps, fade=0.35):
         self.nm = nm; self.fps = float(fps); self.fade = float(fade)
         self.cur = -1; self.prev = -1; self.left = 0.0; self.since = 0.0
@@ -542,14 +489,11 @@ class Sand:
 
     EDGE = np.float32(0.972)
 
-    # PHYSICS IS DEFINED AT 24 STEPS PER SECOND AND RESCALED FOR ANY OTHER RATE.
-    # Raising --fps without this does not make the same picture smoother, it makes
-    # a DIFFERENT picture: the integrator takes five times as many steps per second
-    # of audio, so the sand travels five times as far. Measured at --fps 120 before
-    # this existed -- "settled" fell from 99% to 69% and figure-hold from 1.7s to
-    # 0.2s, i.e. the plate stopped converging at all. Diffusion scales with
-    # sqrt(dt) because a random walk's spread goes as the square root of step
-    # count; drift and transport scale with dt because they are velocities.
+    # PHYSICS RUNS AT 24 STEPS/SECOND AND IS RESCALED FOR ANY OTHER RATE. Without
+    # this, --fps 120 is not a smoother picture but a different one: five times the
+    # steps per second of audio, so the sand travels five times as far (measured:
+    # "settled" fell 99% -> 69%). Diffusion scales with sqrt(dt), because a random
+    # walk spreads as the root of step count; drift and transport scale with dt.
     REF_FPS = 24.0
 
     def __init__(self, n, subw, subh, bank, seed=11, fps=REF_FPS):
@@ -667,9 +611,6 @@ class Screen:
         self.bg = np.zeros((rows, cols), dtype=np.uint8)
         self.prev_bg = np.full((rows, cols), 255, dtype=np.uint8)
 
-    def reset_accum(self):
-        self.accum = None
-
     def set_field_bg(self, E, bank, strength=1.0):
         """Wash the plate with the energy driving it.
 
@@ -678,23 +619,28 @@ class Screen:
         only shows up in the byte budget during a cross-fade.
         """
         rows, cols = self.rows, self.cols
-        ys = np.clip((np.arange(rows) * 4 + 2) * (bank.ph / float(self.subh)),
-                     0, bank.ph - 1).astype(np.int32)
-        xs = np.clip((np.arange(cols) * 2 + 1) * (bank.pw / float(self.subw)),
-                     0, bank.pw - 1).astype(np.int32)
-        cell = E.reshape(bank.ph, bank.pw)[ys[:, None], xs[None, :]]
-        inside = bank.inside[ys[:, None], xs[None, :]]
-        # QUANTISED AND DITHERED. A cell is the smallest thing that can hold a
-        # background colour -- braille sub-dots only carry the foreground -- so
-        # this wash is drawn at one colour per CELL while the sand is drawn at
-        # 2x4 per cell. With 5 levels the steps between them landed on cell
-        # boundaries and the plate read as a grid of blocks, which got worse when
-        # the wash was brightened: measured on a 187x38 window (a real screensaver
-        # window at font size 18) the whole disc is only 38 cells tall, so each
-        # block is enormous. More levels shrink each step, and an ordered Bayer
-        # threshold scatters the remaining boundary so it stops lining up into
-        # rectangles. The pattern depends only on cell POSITION, so it is static:
-        # it costs nothing in the frame-to-frame diff that drives output size.
+        # SAMPLE THE CELL, DO NOT POKE IT. This read one plate pixel per cell
+        # and called it the cell's energy. A cell spans 2x4 sub-dots, so at a
+        # real window size that point missed most of what it stood for --
+        # neighbouring cells could sample opposite sides of a nodal line and
+        # land two levels apart, which is the mottling that reads as blocks.
+        # Four samples per cell, averaged, is still cheap and actually
+        # describes the area it fills.
+        E2 = E.reshape(bank.ph, bank.pw)
+        yq = (np.arange(rows) * 4)[:, None] + np.array([1, 3])[None, :]
+        xq = (np.arange(cols) * 2)[:, None] + np.array([0, 1])[None, :]
+        ys = np.clip(yq.ravel() * (bank.ph / float(self.subh)), 0, bank.ph - 1).astype(np.int32)
+        xs = np.clip(xq.ravel() * (bank.pw / float(self.subw)), 0, bank.pw - 1).astype(np.int32)
+        blk = E2[ys[:, None], xs[None, :]].reshape(rows, 2, cols, 2)
+        cell = blk.mean(axis=(1, 3))
+        inside = bank.inside[ys[:, None], xs[None, :]].reshape(rows, 2, cols, 2).any(axis=(1, 3))
+        # QUANTISED AND DITHERED. Background colour is a per-CELL attribute while sand
+        # is drawn at 2x4 per cell, so the wash has an eighth of the resolution however
+        # it is computed. With few levels the steps land on cell boundaries and the
+        # plate reads as a grid of blocks -- worst at a real window size, where the
+        # disc is only ~38 cells tall. More levels shrink each step and an ordered
+        # Bayer threshold scatters the boundary. The pattern depends only on cell
+        # position, so it is static and costs nothing in the frame diff.
         v = np.clip(np.sqrt(np.clip(cell, 0.0, 1.0)) * strength, 0.0, 1.0)
         bay = (np.array([[0, 8, 2, 10], [12, 4, 14, 6],
                          [3, 11, 1, 9], [15, 7, 13, 5]], dtype=np.float32) + 0.5) / 16.0
@@ -722,31 +668,17 @@ class Screen:
         xi = np.clip(dx, 0, w - 1).astype(np.int32)
         yi = np.clip(dy, 0, h - 1).astype(np.int32)
         cnt = np.bincount(yi * w + xi, minlength=w * h).astype(np.float32)
-        # Give the sand a memory. Counting grain positions fresh every frame
-        # means a sub-dot a grain visited last frame and left this frame goes
-        # black instantly, so a settled figure is only ever as bright as the
-        # grains standing on it at this exact instant -- which is the mechanical
-        # reason the plate read as empty. Decaying at 0.88 keeps about 8 frames
-        # (a third of a second) of history, so a nodal line accumulates into a
-        # solid stroke and a grain in transit leaves a short trail.
-        # The density mapping below calibrates itself per frame, so this needs
-        # no matching gain change: it measures whatever scale it is handed.
-        #
-        # THE MEMORY IS IN SECONDS, NOT FRAMES. "About 8 frames, a third of a
-        # second" was true at 24fps and nowhere else: at 115fps eight frames is
-        # 0.07s. The decay now uses the same clock-measured timestep as the
-        # physics (sand.dts, 1.0 at the reference rate), so a trail lasts a third
-        # of a second at any frame rate.
-        #
-        # AND A DOT IS LIT ONLY ABOVE A REAL THRESHOLD, not above zero. A float
-        # multiplied by 0.88 does not reach zero for hundreds of frames, so "> 0"
-        # lit every sub-dot any grain had crossed in the last ten-plus seconds.
-        # Replaying the real figure schedule headlessly: 20.7% of the canvas lit,
-        # 19.2% of it by history under one grain-visit -- a uniform haze of ghost
-        # dots from lines the sand had already left, which is what buried the live
-        # figure. --dump never showed it because it composes once from a fresh
-        # buffer. 0.35 lets a departed grain's trail fade within about a third of
-        # a second while a grain actually standing there (steady state ~8) stays lit.
+        # GIVE THE SAND A MEMORY, MEASURED IN SECONDS. Counting grains fresh each
+        # frame makes a settled figure only as bright as the grains standing on it
+        # this instant, which is why the plate read as empty. Decaying the accumulated
+        # density keeps about a third of a second of history, so a nodal line builds
+        # into a solid stroke and a grain in transit leaves a trail. The decay uses
+        # the physics' clock-measured timestep, not a frame count: "8 frames" is a
+        # third of a second at 24fps and 0.07s at 115.
+        # A DOT LIGHTS ABOVE 0.35, NOT ABOVE ZERO. A float times 0.88 does not reach
+        # zero for hundreds of frames, so "> 0" lit every sub-dot any grain had
+        # crossed in the last ten seconds -- a 19% ghost haze that buried the live
+        # figure. --dump never showed it: it composes once from a fresh buffer.
         decay = np.float32(0.88 ** float(getattr(sand, "dts", 1.0)))
         if self.accum is None or self.accum.shape != cnt.shape:
             self.accum = cnt.copy()
@@ -769,31 +701,22 @@ class Screen:
         dens = dens + halo * np.float32(0.30)
         if self.under is not None:
             code = code | self.under
-        # Map density to the ramp LOGARITHMICALLY, against a reference the
-        # picture measures on itself.
-        #
-        # Settled sand is bimodal: cells on a nodal line held a median of 58
-        # grains and up to 1055, everything else held none. A linear gain tuned
-        # for either end pins the other -- measured, the old one was 16x too hot
-        # and put 816 cells on pure white with almost nothing in between, which
-        # is why the palette never appeared. A log curve against the 99th
-        # percentile spreads that 2-decade range across the whole ramp, and
-        # deriving the reference per frame keeps it right at any grain count,
-        # terminal size or figure.
+        # Map density to the ramp LOGARITHMICALLY, against a reference measured per
+        # frame. Settled sand is bimodal: cells on a nodal line held a median of 58
+        # grains and up to 1055, everything else none. A linear gain tuned for either
+        # end pins the other -- the old one put 816 cells on pure white with almost
+        # nothing between. A log curve against the 99th percentile spreads that
+        # 2-decade range across the ramp at any grain count, size or figure.
         lit = dens[dens > 0]
         if lit.size > 32:
             ref = float(np.percentile(lit, 99.0))
             self.dref = ref if self.dref is None else self.dref * 0.88 + ref * 0.12
         ref = max(12.0, self.dref if self.dref else 12.0)
-        # THE CURVE, not the reference. Live, a cell on a nodal line averaged level
-        # 5.6 of 13 -- the teal/gold boundary -- so figures read cold next to the
-        # settled --dump stills. Measured over 15s of real playback, three ways of
-        # moving the REFERENCE all made lines DIMMER (5.8, 5.5 against 5.6), because
-        # the faint cells they excluded were holding the percentile down. Widening
-        # the log's span and easing the curve raises the middle without spending the
-        # top: line cells 5.6 -> 7.2, lit cells in the warm half 12.5% -> 22.0%, and
-        # pure white unchanged at 2.6%, so white still means a crossing rather than
-        # "bright". A lower percentile reached 8.9 but put 11% of lit cells on white.
+        # THE CURVE, NOT THE REFERENCE. Line cells averaged level 5.6 of 13 -- the
+        # teal/gold boundary -- so figures read cold. Three ways of moving the
+        # REFERENCE all measured DIMMER, because the faint cells they excluded were
+        # holding the percentile down. Widening the log's span raises the middle
+        # without spending the top: line cells 5.6 -> 7.2, pure white still 2.6%.
         K = 40.0
         a = K / ref
         norm = (np.log1p(np.maximum(dens, 0.0) * a) / math.log1p(K)) ** 0.8
@@ -990,7 +913,14 @@ def sysinfo():
 
 
 TOP_ROWS = 2      # title + rule
-BOT_ROWS = 11     # ayah band (header, 2 translit, 3 translation) + rule + bars + note + hint
+# A FIXED GRID. Every band below the plate has a constant height, so the
+# layout is identical no matter which ayah is playing. It used to derive the
+# band's top edge from the wrapped line count -- a long verse grew the block
+# upward INTO the plate, a short one did not, so the picture rearranged itself
+# every few seconds and the plate overlapped the words on the long ones.
+AYAH_ROWS = 1 + 1 + 2 + 2 + 3   # header, gap, translit x2, gap x2, translation x3
+STRIP_ROWS = 2                  # bar-rule + readout
+BOT_ROWS = AYAH_ROWS + STRIP_ROWS + 1    # + one clear row above the bar
 
 
 def plate_fit(cols, rows):
@@ -1155,20 +1085,34 @@ def draw(chrome, st):
 
     # --- left column ---------------------------------------------------------
     y = 3
-    ch.panel(y, lx, pw, 7, "RECITATION", F, A)
-    ch.put(y + 1, lx + 2, st["name"][:pw - 4], B)
-    ch.put(y + 2, lx + 2, st["sub"][:pw - 4], L)
-    ch.kv(y + 4, lx + 2, pw - 4, "surah", "%d \u00b7 %s" % (st["surah_no"], st["surah"]), L, V)
-    ch.kv(y + 5, lx + 2, pw - 4, "f\u2080 \u00b7 elapsed",
-          "%.0fHz \u00b7 %s" % (st["f0"], mmss(st["t"])), L, V)
-    y += 8
+    # FOCUS vs FULL. Every panel here was judged against one question: does it
+    # explain the picture, or is it telemetry about the program drawing it?
+    # Focus keeps the first kind and moves the rest behind `i`.
+    full = st.get("panels", "focus") == "full"
+    if full:
+        ch.panel(y, lx, pw, 7, "RECITATION", F, A)
+        ch.put(y + 1, lx + 2, st["name"][:pw - 4], B)
+        ch.put(y + 2, lx + 2, st["sub"][:pw - 4], L)
+        ch.kv(y + 4, lx + 2, pw - 4, "surah", "%d \u00b7 %s" % (st["surah_no"], st["surah"]), L, V)
+        ch.kv(y + 5, lx + 2, pw - 4, "f\u2080 \u00b7 elapsed",
+              "%.0fHz \u00b7 %s" % (st["f0"], mmss(st["t"])), L, V)
+        y += 8
+    else:
+        ch.put(y, lx + 2, st["name"][:pw - 4], B)
+        ch.put(y + 1, lx + 2, ("%d \u00b7 %s" % (st["surah_no"], st["surah"]))[:pw - 4], L)
+        y += 4
 
     # --- which modes the voice is driving ------------------------------------
     nm = len(st["amps"])
     room = rows - y - 6
     show = nm if room >= nm + 2 else max(4, room - 2)
+    if not full:
+        show = min(show, 6)
     order = np.arange(nm) if show >= nm else np.argsort(-st["amps"])[:show]
-    ch.panel(y, lx, pw, show + 2, "MODE LADDER", F, A)
+    if full:
+        ch.panel(y, lx, pw, show + 2, "MODE LADDER", F, A)
+    else:
+        ch.put(y, lx + 2, "DRIVEN MODES", A)
     bw = pw - 12
     for i, mi in enumerate(order):
         m, n = st["mn"][mi]
@@ -1189,33 +1133,42 @@ def draw(chrome, st):
     # --- right column --------------------------------------------------------
     y = 3
     m, n = st["mn"][st["dom"]]
-    ch.panel(y, rx, pw, 10, "FIGURE", F, A)
-    ch.put(y + 1, rx + 2, "(%d,%d)" % (m, n), B)
     lab = "J%s(\u03b1r)" % chr(0x2080 + min(m, 9))
-    ch.put(y + 1, rx + 9, lab if m == 0 else lab + "\u00b7cos(%d\u03b8)" % m, L)
-    ch.kv(y + 3, rx + 2, pw - 4, "\u03b1", "%.3f" % st["alpha"][st["dom"]], L, V)
-    ch.kv(y + 4, rx + 2, pw - 4, "freq", "%.0f Hz" % (st["f0"] * st["alpha"][st["dom"]] / st["alpha"][0]), L, V)
-    ch.kv(y + 5, rx + 2, pw - 4, "peak in voice", "%.0f Hz" % st["hz"], L, V)
-    ch.kv(y + 6, rx + 2, pw - 4, "nodal diameters", str(m), L, V)
-    ch.kv(y + 7, rx + 2, pw - 4, "spokes", str(2 * m), L, V)
-    ch.kv(y + 8, rx + 2, pw - 4, "interior rings", str(n - 1), L, V)
-    y += 11
+    lab = lab if m == 0 else lab + "\u00b7cos(%d\u03b8)" % m
+    if full:
+        ch.panel(y, rx, pw, 10, "FIGURE", F, A)
+        ch.put(y + 1, rx + 2, "(%d,%d)" % (m, n), B)
+        ch.put(y + 1, rx + 9, lab, L)
+        ch.kv(y + 3, rx + 2, pw - 4, "\u03b1", "%.3f" % st["alpha"][st["dom"]], L, V)
+        ch.kv(y + 4, rx + 2, pw - 4, "freq", "%.0f Hz" % (st["f0"] * st["alpha"][st["dom"]] / st["alpha"][0]), L, V)
+        ch.kv(y + 5, rx + 2, pw - 4, "voice pitch", "%.0f Hz" % st["hz"], L, V)
+        ch.kv(y + 6, rx + 2, pw - 4, "nodal diameters", str(m), L, V)
+        ch.kv(y + 7, rx + 2, pw - 4, "spokes", str(2 * m), L, V)
+        ch.kv(y + 8, rx + 2, pw - 4, "interior rings", str(n - 1), L, V)
+        y += 11
+    else:
+        ch.put(y, rx + 2, "(%d,%d)" % (m, n), B)
+        ch.put(y, rx + 9, lab, L)
+        ch.put(y + 1, rx + 2, ("%d spokes \u00b7 %d ring%s" % (2 * m, n - 1, "" if n == 2 else "s"))
+               if m else ("%d ring%s" % (n - 1, "" if n == 2 else "s")), L)
+        y += 4
 
-    ch.panel(y, rx, pw, 8, "PLATE", F, A)
-    ch.kv(y + 1, rx + 2, pw - 4, "grains", format(st["grains"], ","), L, V)
-    ch.kv(y + 2, rx + 2, pw - 4, "canvas", "%d\u00d7%d dots" % (st["subw"], st["subh"]), L, V)
-    ch.kv(y + 3, rx + 2, pw - 4, "field", "%d\u00d7%d" % (st["pw"], st["ph"]), L, V)
+    if full:
+        ch.panel(y, rx, pw, 8, "PLATE", F, A)
+        ch.kv(y + 1, rx + 2, pw - 4, "grains", format(st["grains"], ","), L, V)
+        ch.kv(y + 2, rx + 2, pw - 4, "canvas", "%d\u00d7%d dots" % (st["subw"], st["subh"]), L, V)
+        ch.kv(y + 3, rx + 2, pw - 4, "field", "%d\u00d7%d" % (st["pw"], st["ph"]), L, V)
     # A frame rate nobody measured is printed as a dash. In --dump the loop never
     # runs, so this would otherwise show the TARGET -- 240 on a 240Hz monitor --
     # in a still image that looks like a benchmark, for a renderer that measures
     # 67-89fps live. A dashboard number should be a measurement or absent.
-    fps_txt = "\u2014" if not st["fps"] else "%.0f" % st["fps"]
-    ch.kv(y + 4, rx + 2, pw - 4, "modes \u00b7 fps", "%d \u00b7 %s" % (len(st["amps"]), fps_txt), L, V)
-    ch.kv(y + 5, rx + 2, pw - 4, "settled", "%.0f%%" % (100 * st["settled"]), L, V)
-    ch.kv(y + 6, rx + 2, pw - 4, "figure held", "%.1fs" % st["held"], L, V)
-    y += 9
+        fps_txt = "\u2014" if not st["fps"] else "%.0f" % st["fps"]
+        ch.kv(y + 4, rx + 2, pw - 4, "modes \u00b7 fps", "%d \u00b7 %s" % (len(st["amps"]), fps_txt), L, V)
+        ch.kv(y + 5, rx + 2, pw - 4, "settled", "%.0f%%" % (100 * st["settled"]), L, V)
+        ch.kv(y + 6, rx + 2, pw - 4, "figure held", "%.1fs" % st["held"], L, V)
+        y += 9
 
-    if rows - y > 13:
+    if full and rows - y > 13:
         ch.panel(y, rx, pw, 13, "SYSTEM", F, A)
         ch.kv(y + 1, rx + 2, pw - 4, "os", st["os"][:pw - 8], L, V)
         ch.kv(y + 2, rx + 2, pw - 4, "kernel", st["kernel"][:pw - 12], L, V)
@@ -1234,29 +1187,16 @@ def draw(chrome, st):
         ch.kv(y + 11, rx + 2, pw - 4, "host", st["host"][:pw - 10], L, V)
 
     # --- the ayah, across the full width ------------------------------------
-    # It was in the left column at ~30 columns wide, where ayah 7 (95 characters
-    # of translation) wrapped past its allotted lines and got an ellipsis. The
-    # words are the reason any of this is on screen; give them the whole width.
-    # LAID OUT ON A SPACING SCALE, FROM THE BOTTOM UP, AND MEASURED FROM THE
-    # CONTENT RATHER THAN ASSUMED.
-    #
-    # Two defects this replaces, both visible on screen and both caused by
-    # hardcoding row offsets that the content does not respect:
-    #
-    #   * The translation was pinned to ay+3 while the transliteration began at
-    #     ay+1 and could take two lines. So the gap between them was ONE row for
-    #     a short ayah and ZERO for a long one -- the vertical rhythm changed
-    #     depending on which verse was playing, which reads as the whole block
-    #     jittering as the recitation moves.
-    #   * A two-line translation reached ay+4, and ay+4 == rows-4 == the row the
-    #     bottom rule is drawn on, so the last line of the longest verses was
-    #     overwritten by a horizontal line.
-    #
-    # The fix is the standard one for this: pick a unit, derive every gap from
-    # it, and lay out against measured block heights instead of guesses. GAP=1
-    # between a label and what it labels, GAP*2 between distinct groups -- the
-    # proximity rule, where distance encodes relatedness.
-    tl_, tr_ = st["ayah_text"]
+    # The words are the reason any of this is on screen, so they get the full
+    # width rather than the ~30-column left panel that ellipsised them.
+    # GAP=1 between a label and what it labels, GAP*2 between distinct groups:
+    # distance is what says these are different things.
+    # PAD, DO NOT UNPACK. A track whose metadata carries no translation (or
+    # only the transliteration) gave this a 0- or 1-tuple and draw() died with
+    # "not enough values to unpack" -- mid-frame, on a real recitation, with
+    # the terminal still in cbreak.
+    _txt = tuple(st["ayah_text"]) + ("", "")
+    tl_, tr_ = _txt[0], _txt[1]
     GAP = 1
     # MEASURE, not full width. Lines ran to 150 columns -- about 130 characters --
     # where running text is comfortable near 65-75. The words are the reason any of
@@ -1271,9 +1211,12 @@ def draw(chrome, st):
     # enough to a readable measure to be worth the trade.
     tl_lines = [l for l in wrap(tl_, wide, 2) if l] if tl_ else []
     tr_lines = [l for l in wrap(tr_, wide, 3) if l] if tr_ else []
-    # header + gap + translit + gap*2 + translation, sitting directly above the rule
-    block = 1 + GAP + len(tl_lines) + (GAP * 2 + 1 + len(tr_lines) if tr_lines else 0)
-    ay = (rows - 4) - block - 1          # one clear row above the rule, always
+    # THE BAND'S TOP IS A CONSTANT, NOT A FUNCTION OF THE VERSE. Anchored to the
+    # same row every frame and sized for the longest case, so a one-line verse
+    # and a three-line one put their header in exactly the same place and
+    # neither can reach the plate. Short verses leave the tail of the band
+    # blank, which is what keeps the rhythm still.
+    ay = rows - BOT_ROWS
     if tl_lines and ay > 4:
         hdr = "%d : %d   of %d   \u00b7   %s   \u00b7   %s" % (
             st["surah_no"], st["ayah"], st["n_ayat"], st["surah"], st["revelation"])
@@ -1293,29 +1236,53 @@ def draw(chrome, st):
             r += 1
 
     # --- bottom ---------------------------------------------------------------
-    br = rows - 4
-    ch.rule(br, 2, cols - 4, F)
-    ch.put(br + 1, 2, "drive", L)
-    ch.bar(br + 1, 8, 16, st["level"] / 1.6, A, D, empty="\u00b7")
-    ch.put(br + 1, 26, "ayah %d/%d" % (st["ayah"], st["n_ayat"]), L)
-    bx, bwid = 34, max(10, cols - 34 - 16)
-    ch.bar(br + 1, bx, bwid, st["t"] / max(1e-6, st["dur"]), V, D, empty="\u00b7")
-    # ayah boundaries, marked on the passage bar
-    for k, a_t in enumerate(st["ayat"]):
-        pos = bx + int((a_t / max(1e-6, st["dur"])) * bwid)
-        if bx <= pos < bx + bwid:
-            ch.put(br, pos, "\u2577", D if k != st["ayah"] - 1 else A)
+    # THE RULE IS THE BAR. The separator under the plate and a full-width
+    # progress bar draw the same horizontal stroke, so they share one row --
+    # which is how the strip went from three rows to two. Gold is everything
+    # recited, bright is the ayah playing now, hairline is what is left.
+    #
+    # The old per-ayah ticks are gone because they could not survive a long
+    # surah: Yaseen's 83 boundaries across 80 columns is a dotted line, not
+    # information. The bright segment carries position WITHIN the ayah instead,
+    # which is the fact the ticks were there to give and holds at any length.
+    br = rows - 2
+    x0, wid = 2, max(10, cols - 4)
+    done = int(round(float(np.clip(st["t"] / max(1e-6, st["dur"]), 0.0, 1.0)) * wid))
+    a_t = st["ayat"][st["ayah"] - 1] if st["ayat"] else 0.0
+    head = min(done, int(round(float(np.clip(a_t / max(1e-6, st["dur"]), 0.0, 1.0)) * wid)))
+    ch.put(br, x0, "\u2501" * head, A)
+    ch.put(br, x0 + head, "\u2501" * (done - head), B)
+    ch.put(br, x0 + done, "\u2500" * (wid - done), F)
+
+    # One readout line, three zones. The surah and reciter are NOT repeated
+    # here -- they are already top-left; the strip carries only what nothing
+    # else on screen carries. Drive has no label: that lives in `i`.
+    lit = int(round(float(np.clip(st["level"] / 1.6, 0.0, 1.0)) * 7))
+    ch.put(br + 1, 2, "\u25ae" * lit, A)
+    ch.put(br + 1, 2 + lit, "\u25af" * (7 - lit), F)
+    pos = "ayah %d of %d" % (st["ayah"], st["n_ayat"])
+    ch.put(br + 1, max(11, (cols - len(pos)) // 2), pos, L)
     tail = "%s / %s" % (mmss(st["t"]), mmss(st["dur"]))
     ch.put(br + 1, cols - 2 - len(tail), tail, L)
-    note = ("E = \u03a3 a\u1d62\u00b2 U\u1d62\u00b2   \u00b7   incoherent sum: sand rests only where every driven "
-            "mode is quiet   \u00b7   clamped membrane, not a free-edge plate")
-    ch.put(br + 2, max(2, (cols - len(note)) // 2), note[:cols - 4], D)
-    hint = "s settings \u00b7 i what is this \u00b7 any key exits"
-    ch.put(br + 3, cols - 2 - len(hint), hint, D)
+
+    # The hints are the only route to `i` and `s`, so they cannot simply be
+    # deleted -- but a screensaver that keeps announcing its own keybindings is
+    # not at rest. They ride over the bar for 8s after launch and after any
+    # key, then get out of the way.
+    if st.get("hints"):
+        # Right-aligned, not centred: the right end of the bar is the part that
+        # has not been played yet, so the hints cover the stretch carrying the
+        # least information. Centred, they sat exactly where the fill ends.
+        hint = " i what am I looking at   \u00b7   s settings   \u00b7   any key exits "
+        ch.put(br, max(2, cols - 2 - len(hint)), hint, D)
 
 
 # ---------------------------------------------------------------- runtime ---
 RUN = {"go": True, "resized": False}
+# Deadline for the transient key hints over the progress bar; bumped on
+# every keypress so they come back whenever someone is actually at the
+# keyboard, and stay gone the rest of the time.
+HINTS = {"until": 0.0}
 
 
 def _stop(*_a):
@@ -1438,9 +1405,6 @@ class Audio:
                 pass
             self.proc = None
 
-    def playing(self):
-        return self.proc is not None and self.proc.poll() is None
-
 
 def die_with_parent():
     """Ask the kernel to kill us if the launcher goes away.
@@ -1510,10 +1474,23 @@ def detect_refresh(default=60.0):
 
 
 def load_timeline(path):
+    """The analysed recitation, or None to fall back to a synthetic timeline.
+
+    A MISSING file was always handled; a DAMAGED one was not, and a truncated
+    or bit-flipped npz raised BadZipFile straight out of main() -- before the
+    try/finally, so it crashed AND left the terminal in cbreak. Same outcome
+    for the user either way, so treat unreadable as absent and say so on stderr.
+    """
     if not os.path.exists(path):
         return None
-    z = np.load(path, allow_pickle=False)
-    meta = json.loads(str(z["meta"]))
+    try:
+        z = np.load(path, allow_pickle=False)
+        meta = json.loads(str(z["meta"]))
+    except Exception as e:
+        sys.stderr.write("cyscreen: %s is unreadable (%s: %s) -- "
+                         "falling back to a synthetic timeline\n"
+                         % (path, type(e).__name__, e))
+        return None
     if isinstance(meta, list):                       # timeline from before ayat
         meta = {"tracks": meta}
     out = {"amps": z["amps"].astype(np.float32), "lvl": z["lvl"].astype(np.float32),
@@ -1560,7 +1537,8 @@ MENU_ITEMS = [
     ("tint",      "tint",         [0.0, 0.12, 0.22, 0.4],      "live"),
     ("gap",       "gap",          [0.0, 1.5, 3.0, 6.0],        "live"),
     ("subtitles", "subtitles",    [True, False],               "live"),
-    ("panels",    "panels",       [True, False],               "live"),
+    ("panels",    "panels",       ["focus", "full", "off"],    "live"),
+    ("wash",      "membrane",     [0.0, 0.35, 0.55, 0.8, 1.0], "live"),
 ]
 
 MENU_HELP = {
@@ -1572,7 +1550,8 @@ MENU_HELP = {
     "tint":      "how far the palette turns with each reciter. 0 keeps one palette",
     "gap":       "seconds of quiet between recitations",
     "subtitles": "the ayah, its transliteration and its meaning",
-    "panels":    "the side panels and the dashboard",
+    "panels":    "focus keeps what explains the art; full adds the telemetry",
+    "wash":      "glow of the vibrating plate under the sand. 0 leaves only sand",
 }
 
 
@@ -1664,6 +1643,17 @@ INFO = [
         "a, i and u with a bar over them are held long.",
         "Bottom line: what it means, in Muhammad Asad's English translation.",
     ]),
+    ("Under the plate, the line", [
+        "The rule beneath the plate is also the timeline: gold is what has been recited,",
+        "the bright tip is the verse being read now, the thin part is what is left.",
+        "The seven marks bottom-left are drive -- how hard the voice is hitting the plate.",
+    ]),
+    ("Why the sand lands where it does", [
+        "E = \u03a3 a\u1d62\u00b2 U\u1d62\u00b2 -- an INCOHERENT sum, not (\u03a3 a\u1d62U\u1d62)\u00b2.",
+        "Sand rests only where every driven mode is quiet at once, so one clean tone gives",
+        "you lines and a chord gives you isolated dots. This is a clamped membrane, not a",
+        "free-edge metal plate, and says so: a real plate's modes are not Bessel functions.",
+    ]),
     ("Right", [
         "FIGURE names the standing wave: (2,2) is 2 nodal diameters -- so 4 spokes -- and 1 ring.",
         "J is a Bessel function, the mathematics of how a circular membrane vibrates.",
@@ -1675,19 +1665,35 @@ INFO = [
 
 def draw_info(ch, cols, rows, C):
     """Plain-English guide to the screen, for a viewer who knows none of this."""
-    body = [ln for _title, lines in INFO for ln in ([""] + lines)]
+    # DROP WHOLE SECTIONS RATHER THAN OVERFLOW. Chrome.panel() refuses to draw a
+    # box taller than the grid and returns silently, so a window too short for
+    # the full guide used to open the overlay onto nothing at all -- a help
+    # screen that disappears exactly on the small terminals that need it most.
+    rendered, used = [], 5
+    for title, lines in INFO:
+        if used + len(lines) + 2 > rows - 2:
+            break
+        rendered.append((title, lines))
+        used += len(lines) + 2
+    if not rendered:
+        return
+    body = [ln for _t, lines in rendered for ln in ([""] + lines)]
     w = min(cols - 6, max(len(l) for l in body) + 6)
-    h = len(body) + len(INFO) + 5
+    h = len(body) + len(rendered) + 5
     r0 = max(1, (rows - h) // 2)
     c0 = max(2, (cols - w) // 2)
     ch.panel(r0, c0, w, h, "WHAT AM I LOOKING AT", C["rule"], C["accent"])
     r = r0 + 2
-    for title, lines in INFO:
+    for title, lines in rendered:
         ch.put(r, c0 + 2, title, C["accent"]); r += 1
         for ln in lines:
             ch.put(r, c0 + 2, ln[:w - 4], C["value"]); r += 1
         r += 1
-    ch.put(r0 + h - 2, c0 + 2, "i closes this \u00b7 s settings \u00b7 any other key exits", C["label"])
+    foot = "i closes this \u00b7 s settings \u00b7 any other key exits"
+    if len(rendered) < len(INFO):
+        foot = "%d more section%s need a taller window \u00b7 " % (
+            len(INFO) - len(rendered), "" if len(INFO) - len(rendered) == 1 else "s") + foot
+    ch.put(r0 + h - 2, c0 + 2, foot[:w - 4], C["label"])
 
 
 _tty_saved = None
@@ -1700,7 +1706,9 @@ def keyboard(on=True):
     script -- which meant the renderer never saw a keystroke and could not offer
     anything but exiting. Now the renderer reads the keys and keeps the same
     contract: any key still quits, except the ones that open and drive the menu.
-    Restored on every exit path; a terminal left in cbreak mode is a broken shell.
+    A terminal left in cbreak mode is a broken shell, so main() also registers
+    keyboard(False) with atexit -- the finally block alone did not cover the
+    early-return paths.
     """
     global _tty_saved
     try:
@@ -1743,6 +1751,7 @@ def read_keys():
 
 def main():
     launched_at = time.time()
+    HINTS["until"] = launched_at + 8.0
     ap = argparse.ArgumentParser()
     ap.add_argument("--fps", type=float, default=0.0,
                     help="target frame rate (default: the monitor's refresh rate)")
@@ -1763,11 +1772,19 @@ def main():
     ap.add_argument("--gap", type=float, default=DEFAULT_GAP, help="seconds of quiet between reciters")
     args = ap.parse_args()
     keyboard(True)                 # before the timeline load, so early keys are not lost
+    # RESTORE ON *EVERY* PATH, NOT JUST THE ONE WITH THE finally. keyboard(True)
+    # runs here, but the try/finally that undid it starts ~180 lines below --
+    # so --dump's `return 0`, a corrupt timeline.npz raising out of
+    # load_timeline, and any other early exit all left the terminal in cbreak
+    # and handed the user a broken shell. atexit covers returns, sys.exit and
+    # uncaught exceptions alike; keyboard(False) is idempotent, so the existing
+    # finally running first is harmless.
+    atexit.register(keyboard, False)
     # settings file supplies anything not given on the command line
     if args.fps <= 0:
         want_fps = SETTINGS.get("fps", "auto")
         args.fps = detect_refresh() if want_fps == "auto" else float(want_fps)
-    if SETTINGS.get("panels") is False:
+    if SETTINGS.get("panels") == "off":
         args.no_chrome = True
     if args.gap == DEFAULT_GAP:
         args.gap = float(SETTINGS.get("gap", DEFAULT_GAP))
@@ -1815,15 +1832,10 @@ def main():
     pending_size, pending_at = (0, 0), 0.0
     offs = tl["offsets"]; total = int(offs[-1])
     if args.start is None:
-        # START ON A RANDOM TRACK, not at zero. A screensaver is not an album:
-        # it runs for a few minutes and is killed by a keypress, so a fixed
-        # start means only the first track or two is ever seen. With a 55 min
-        # playlist and Ya-Sin sitting at position 16, starting at 0 every time
-        # meant the long recitations were unreachable in practice.
-        #
-        # Snap to a track BOUNDARY rather than a random second, so a session
-        # always opens on the first ayah of something rather than halfway
-        # through a word.
+        # START ON A RANDOM TRACK BOUNDARY. A screensaver runs for minutes and dies on
+        # a keypress, so a fixed start means only the first track or two is ever seen;
+        # with Ya-Sin at position 16 of a 55-minute playlist the long recitations were
+        # unreachable. Snapping to a boundary opens on a first ayah, not mid-word.
         starts = [int(o) for o in offs[:-1]] or [0]
         gi = starts[random.randrange(len(starts))]
     else:
@@ -1864,6 +1876,8 @@ def main():
                 "surah": md.get("surah", "\u2014"), "surah_no": md.get("surah_no", 0),
                 "n_ayat": md.get("n_ayat", len(ayat)), "revelation": md.get("revelation", ""),
                 "ayah": ai + 1, "ayah_text": txt, "ayah_frac": float(frac), "ayat": ayat,
+                "panels": SETTINGS.get("panels", "focus"),
+                "hints": time.time() < HINTS["until"],
                 "theme": info["theme"], "os": info["os"], "kernel": info["kernel"],
                 "host": info["host"], "cpu": info["cpu"], "gpu": info["gpu"],
                 "pkgs": info["pkgs"], "shell": info["shell"], "res": info["res"],
@@ -1888,7 +1902,7 @@ def main():
         fps_meas = 0.0          # nothing was timed; the dashboard shows a dash
         for i in range(700):
             sand.step(E, GX, GY, 0.85 if i < 60 else 0.30)
-        scr.set_field_bg(E, bank)
+        scr.set_field_bg(E, bank, float(SETTINGS.get("wash", 0.55)))
         ch, lv, bgv = scr.compose(sand, gain)
         if not args.no_chrome:
             draw(chrome, state(gi, amps, (sel.cur,)))
@@ -1979,31 +1993,23 @@ def main():
             else:
                 w = sel.update(amps, bank.select)
             E, GX, GY = bank.field_w(w)
-            # REDRAW THE WASH THROUGH THE WHOLE CROSSFADE, AND ONCE AS IT ENDS.
-            # set_field_bg's docstring always said it was recomputed "during a
-            # cross-fade"; this call site only fired when sel.cur changed, which is
-            # the FIRST frame of the fade, when E is still almost entirely the
-            # outgoing figure. So the wash froze on the previous figure and the new
-            # figure's nodal lines were drawn across its bright antinodes. Measured
-            # under sand sitting on the current lines: mean wash level 0.47 as set,
-            # against 0.03 from the current field.
+            # REDRAW THE WASH THROUGH THE WHOLE CROSSFADE. This fired only when sel.cur
+            # changed -- the first frame of the fade, when E is still almost entirely the
+            # outgoing figure -- so the wash froze on the previous figure and the new
+            # figure's nodal lines were drawn across its bright antinodes.
             fading = float(getattr(sel, "left", 0.0)) > 0.0
             if sel.cur != last_fig or fading or was_fading:
                 last_fig = sel.cur
-                scr.set_field_bg(E, bank)
+                scr.set_field_bg(E, bank, float(SETTINGS.get("wash", 0.55)))
             was_fading = fading
             # Loudness drives how hard the plate is hit; the spectrum decides
             # which modes. Keeping them separate stops quiet passages freezing
             # the sand and loud ones blowing the figure apart.
             lv_drive = float(tl["lvl"][gi % total])
-            # The figure changes on a multi-second schedule, so this is the
-            # only channel that answers the voice instantly. Give it real range.
-            # COEFFICIENT RESCALED WITH THE FIX ABOVE. Once lvl stopped
-            # saturating, its median fell from 1.599 to 0.768 -- so the old
-            # 0.55 slope, tuned against a signal pinned at its ceiling, halved
-            # the plate's total energy and would have traded a frozen plate for
-            # a limp one. Slope raised to put the median back where it was while
-            # keeping the swing the fix bought (1.55x -> ~2.2x).
+            # The figure changes on a multi-second schedule, so this is the only channel
+            # that answers the voice instantly. Slope rescaled once lvl stopped saturating
+            # (median 1.599 -> 0.768); the old value, tuned against a signal pinned at its
+            # ceiling, would have halved the plate's energy.
             agit = 0.10 + 1.05 * float(np.clip(lv_drive, 0.0, 1.6))
             # dt FROM THE CLOCK, NOT FROM THE FLAG. Setting this once from
             # --fps was correct about the number it was given and silent about
@@ -2019,6 +2025,7 @@ def main():
             sand.step(E, GX, GY, agit)
             ch, lvv, bgv = scr.compose(sand, gain)
             for k in read_keys():
+                HINTS["until"] = time.time() + 8.0
                 if info_open and k != "i":
                     info_open = False
                     if k in ("s", ","):
@@ -2035,7 +2042,7 @@ def main():
                         elif key == "gap":
                             args.gap = float(val)
                         elif key == "panels":
-                            args.no_chrome = not val
+                            args.no_chrome = (val == "off")
                         elif key == "volume":
                             audio.volume = float(val)
                         elif key == "grains":
@@ -2062,19 +2069,12 @@ def main():
                 elif info_open:
                     draw_info(chrome, cols, rows, C)
                 ch, lvv, bgv = chrome.composite(ch, lvv, bgv)
-            # Retint when the held figure changes. The lookup table is shared by
-            # every cell, so changing it invalidates the whole diff -- force one
-            # full repaint rather than let stale colours linger.
-            # TINT PER RECITATION, NOT PER FIGURE, and gently. Keyed to the
-            # figure this rotated the whole palette every time the figure
-            # changed -- which after the schedule was tightened is every 1.08s
-            # (median) -- so the plate strobed through hues and, worse, every
-            # retint invalidates the shared lookup table and forces a FULL
-            # repaint: roughly one complete redraw per second, against a byte
-            # budget the rest of the renderer works hard to keep at 0.12 MB/s.
-            # At half amplitude it also reached magenta and acid green, which is
-            # not a colour this plate has. Per track it changes when the voice
-            # does, which is what a viewer reads as "a new recitation".
+            # TINT PER RECITATION, NOT PER FIGURE. Keyed to the figure it rotated the
+            # palette every 1.08s (median), strobing through hues -- and every retint
+            # invalidates the shared lookup table, forcing a full repaint about once a
+            # second against a 0.12 MB/s byte budget. At half amplitude it also reached
+            # magenta and acid green, not colours this plate has. The forced repaint
+            # below is still required: the table is shared by every cell.
             want = float(MODE_HUE[track % len(MODE_HUE)]) * float(SETTINGS.get("tint", 0.22))
             if cur_hue is None or abs(want - cur_hue) > 1e-6:
                 cur_hue = want
@@ -2129,19 +2129,11 @@ def main():
                     last_fig = -2
                     scr.set_underlay(plate_ring(bank, subw, subh), C["rule"])
                     info["res"] = term_pixels() or info["res"]
-                    # 2J ALONE LEFT FRAGMENTS OF THE OLD LAYOUT ON SCREEN --
-                    # visible as a duplicate SYSTEM panel and stale rectangles
-                    # after the window went fullscreen. The terminal reflows on
-                    # resize, so content can land outside the viewport 2J
-                    # clears. 3J drops the scrollback too, and H parks the
-                    # cursor at origin so the first repaint starts from a known
-                    # cell rather than wherever the reflow left it.
-                    # CLEAR ONLY WHEN THE GRID SHRANK. A fresh Screen has an
-                    # empty diff buffer, so the next frame repaints every cell
-                    # anyway -- clearing as well just inserts a black flash, and
-                    # on a zoom burst that flash IS the glitching. Growing leaves
-                    # no stale cells to erase (the new ones start blank); only
-                    # shrinking can strand content outside the new grid.
+                    # 3J, NOT JUST 2J, AND ONLY WHEN THE GRID SHRANK. The terminal reflows on
+                    # resize, so content can land outside the viewport 2J clears; 3J drops the
+                    # scrollback and H parks the cursor at origin. But a fresh Screen repaints
+                    # every cell anyway, so clearing when the grid GREW only inserts a black
+                    # flash -- on a zoom burst that flash IS the glitching.
                     if shrank:
                         sys.stdout.write("\033[3J\033[2J\033[H"); sys.stdout.flush()
                     pending_size, pending_at = (0, 0), 0.0
