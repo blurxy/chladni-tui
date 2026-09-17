@@ -4,8 +4,16 @@
 
 ![the plate](docs/screensaver.png)
 
+<sub>Husary reciting Ya-Sin 36:14. The figure is (1,3) — one nodal diameter and two
+interior rings, at 0.377 and 0.690 of the radius where J₁'s zeros put them. Its
+frequency is **550 Hz**; the peak in the voice at that moment is **551 Hz**. That is
+one well-chosen frame: across the whole library the correlation between recited
+pitch and the figure shown is a median of 0.50 per track. Rendered headlessly by
+`tools/render-dump.py`, so it carries no desktop.</sub>
+
 Sand on a vibrating plate collects wherever the plate is still. This simulates
-that — 50,000 grains on a clamped circular membrane, real Bessel eigenmodes — and
+that — 45,000 to 300,000 grains depending on plate size, on a clamped circular
+membrane with real Bessel eigenmodes — and
 renders it in braille sub-dots, so one terminal cell becomes a 2×4 block of
 pixels. Which figure appears is decided by analysing an actual recording.
 
@@ -24,17 +32,24 @@ seconds**. Sand needs **seconds** to migrate across the plate. Drive the field
 straight from the spectrum and the grains spend the entire time in transit — the
 plate never forms a figure at all, it just looks like noise.
 
-So the spectrum is integrated over ~2 s, a mode is committed to, held long
-enough to actually settle, and cross-faded when the recording has clearly moved
-on. And because the analysis is offline, the schedule does not have to be
-*causal*: it is smoothed **forward and backward** so the decision is centred on
-the moment rather than lagging it, then shifted **1.5 s early**, so a transition
-begins before the audio does and the sand has stopped moving by the time you hear
-why.
+So the spectrum is smoothed, a mode is committed to, held long enough to settle,
+and cross-faded when the recording has clearly moved on. Because the analysis is
+offline, the schedule does not have to be *causal*: it is smoothed **forward and
+backward** so the decision is centred on the moment rather than lagging it, then
+shifted early so a transition begins before the audio does.
+
+The first tuning of that overcorrected into a different desync. Smoothing over
+1.6 s and holding for 3 s removed the lag and replaced it with a **lock**: the
+figure settled and then sat there while the recitation moved on. A captured frame
+showed it directly — the figure panel read (1,1) while the live mode ladder's
+loudest modes were (5,1) and (0,3), with "figure held 3.9s" printed beside it.
+Recitation changes pitch roughly every half-second to second, so it is now
+smoothed over 0.55 s, held 0.9 s, and led by 0.45 s.
 
 ```
-figure schedule: zero-phase smoothing, hysteresis, 1.5s lead
-measured: every transition fires at -1.50s against the naive causal schedule
+figure schedule: zero-phase smoothing (tau 0.55s), hold 0.9s, lead 0.45s
+measured: all 1,438 transitions fire 0.46s early against the same schedule
+          with no lead (0.45s, snapped to whole frames at 24 fps)
 ```
 
 ## Things that were wrong, and how they were found
@@ -72,6 +87,78 @@ its *energy* goes as `r²ᵐ`. For (5,1) that is below 2% of peak out to 0.36 of
 radius — grains random-walk in and cannot get out. The dead zone is now measured
 per mode (0.00 for (0,1), 0.36 for (5,1)); one fixed radius cannot be right for
 all of them.
+
+**…and the fix for the mush dug a hole.** The dead zone was agitated uniformly,
+which stops a blob forming but cannot tell a nodal diameter from the space between
+two, so it swept the diameters out as well: a (2,1) cross rendered as four
+separate spokes ending in a ring of piled sand. Histogramming grain radius on a
+pure (2,1) field found **0 grains inside r = 0.05** and a ring at **6.76× uniform
+density** exactly where the treatment ended. Two causes, and fixing the obvious one
+alone changed nothing. The agitation is now shaped by `cos²(mθ)`, which is exactly
+zero on every diameter at every radius. But the drift had used the full gradient
+of `core(r)·cos²(mθ)`, and by the product rule that includes a **radial, outward**
+term — measured at +0.68 outward *on the nodal diagonal itself*. The drift now uses
+only the tangential term, computed analytically, because `np.gradient` of a polar
+pattern on a Cartesian grid leaks small radial components that still emptied
+high-m cores over hundreds of steps. After: density at r = 0.05–0.10 rose from
+0.24× to **5.98×** uniform and the ring flattened to 3.38×. High-m figures still
+keep a small clear centre — at r = 0.07 a (5,1) figure's ten spokes are ~4.6
+sub-dots apart and cannot be drawn as separate lines.
+
+**The figure did not follow the voice — because it was told not to.** Each
+recording's `f0` sets the whole mode ladder, and the search that picked it weighted
+`variety` — the fraction of the 20 modes used — as its largest term. So it chose
+whichever `f0` spread figures most evenly, and got exactly that: occupancy was
+**9–12% per mode**, near-uniform, a plate cycling through shapes on a schedule of
+its own. Variety should be a consequence of a good `f0`, never the target.
+Underneath it was a second defect the first one hid: the search grid ran 70–130 Hz
+and the ladder spans ~5.5× its `f0`, topping out near 720 Hz — while the recited
+pitch has a median of 410 Hz and a 90th percentile of **1,131 Hz**. No candidate
+could have answered most of the voice, and the winner still looked like a winner.
+The objective now scores **coverage** (does the ladder span this voice) and
+**tracking** (does the figure climb when the pitch climbs), over a grid reaching
+350 Hz. Now: occupancy concentrates (27%, 16%, 12%, 11%, 5% for the top five), and
+tracking — the correlation between recited pitch and the frequency of the figure
+shown — has a per-track median of **0.50** (0.24–0.75), **0.375** across the whole
+library. There is a ceiling on that number worth naming: pitch here is the FFT's
+spectral peak, often a harmonic rather than the fundamental.
+
+> A correction to this repo's own history: commit `76eafcc` cites a correlation of
+> 0.258 as the "before" figure. That number was computed with the first track's
+> `f0` applied to every track, which mislabels mode frequencies wherever `f0`
+> differs; the same method understates the current library as 0.293 against a
+> correct 0.375. The old timeline was overwritten, so no valid "before"
+> correlation exists — the occupancy and grid-ceiling evidence above does not
+> depend on it.
+
+**The loudness channel was a flat line.** Frame-by-frame loudness is the only thing
+that answers the voice instantly, and it was computed against a hardcoded
+reference that these recordings saturated: median 1.599, 90th percentile 1.600,
+maximum 1.600 — over half of every track pinned at the clip ceiling, so the plate
+was struck with identical force through loud passages and silence. Referenced to
+each track's own 90th-percentile loudness, no frame sits at the ceiling and the
+swing in agitation went from 1.55× to 2.18×.
+
+**A faster frame rate made a different picture, not a smoother one.** Raising the
+frame rate ran the physics more times per second of audio, so at 120 fps sand
+travelled five times as far: "settled" fell from 99% to 69% and figures held for
+0.2 s. Diffusion now scales with `√dt` and drift with `dt`, and `dt` is read from
+the clock rather than the requested rate, because asked for 120 the renderer
+sustains about 67–89 — a timestep derived from the flag would have run the physics
+at 55% speed. The default rate is the refresh rate of the monitor it opens on.
+
+**Every visual check was of the wrong program.** The screenshots were real,
+correctly captured, and of a stale window: `setsid foot &` returns a PID that is
+not the window's process, so killing it never closed the previous instance, the
+new code crashed on launch (a variable used four lines before it was assigned),
+and the old window stayed up to be photographed. The crash shipped in two commits
+reported as visually verified. `tools/render-dump.py` replaces that method: it runs
+`--dump` in a pseudo-terminal of a chosen size and draws the output straight to a
+PNG — no terminal, window or compositor, so the same arguments give the same image
+and there is no stale process to photograph. It refuses to write a frame with no
+plate in it, which is how it found the crash on its second run; its *first* run had
+rendered an argparse error into a PNG and reported success. Every image in this
+README is now produced by it, with `--anonymise`.
 
 ## The physics
 

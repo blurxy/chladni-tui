@@ -1016,7 +1016,12 @@ def draw(chrome, st):
     ch.kv(y + 1, rx + 2, pw - 4, "grains", format(st["grains"], ","), L, V)
     ch.kv(y + 2, rx + 2, pw - 4, "canvas", "%d\u00d7%d dots" % (st["subw"], st["subh"]), L, V)
     ch.kv(y + 3, rx + 2, pw - 4, "field", "%d\u00d7%d" % (st["pw"], st["ph"]), L, V)
-    ch.kv(y + 4, rx + 2, pw - 4, "modes \u00b7 fps", "%d \u00b7 %.0f" % (len(st["amps"]), st["fps"]), L, V)
+    # A frame rate nobody measured is printed as a dash. In --dump the loop never
+    # runs, so this would otherwise show the TARGET -- 240 on a 240Hz monitor --
+    # in a still image that looks like a benchmark, for a renderer that measures
+    # 67-89fps live. A dashboard number should be a measurement or absent.
+    fps_txt = "\u2014" if not st["fps"] else "%.0f" % st["fps"]
+    ch.kv(y + 4, rx + 2, pw - 4, "modes \u00b7 fps", "%d \u00b7 %s" % (len(st["amps"]), fps_txt), L, V)
     ch.kv(y + 5, rx + 2, pw - 4, "settled", "%.0f%%" % (100 * st["settled"]), L, V)
     ch.kv(y + 6, rx + 2, pw - 4, "figure held", "%.1fs" % st["held"], L, V)
     y += 9
@@ -1355,7 +1360,14 @@ def main():
         starts = [int(o) for o in offs[:-1]] or [0]
         gi = starts[random.randrange(len(starts))]
     else:
-        gi = int(np.clip(args.start * args.fps, 0, total - 1))
+        # SECONDS OF TIMELINE, CONVERTED AT THE TIMELINE'S RATE. This used args.fps,
+        # which was the same number (24) until the display's refresh rate became
+        # the default. On a 240Hz monitor --start 3000 then asked for frame
+        # 720,000 of a 170,220-frame timeline, was clamped to the last frame, and
+        # every --start rendered the same final moment. The analysis runs at its
+        # own fixed rate; the display rate is for pacing only.
+        tl_fps = float(tl["meta"][0].get("fps", 24.0)) if tl.get("meta") else 24.0
+        gi = int(np.clip(args.start * tl_fps, 0, total - 1))
 
     stats = livestats(info)
 
@@ -1404,6 +1416,7 @@ def main():
         # changed this path's meaning, which is the kind of regression a flag
         # that only runs on request is best at hiding.
         sand.dts = 1.0
+        fps_meas = 0.0          # nothing was timed; the dashboard shows a dash
         for i in range(700):
             sand.step(E, GX, GY, 0.85 if i < 60 else 0.30)
         scr.set_field_bg(E, bank)
