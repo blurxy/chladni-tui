@@ -1189,6 +1189,61 @@ def _winch(*_a):
     RUN["resized"] = True
 
 
+_SYNC_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+_AUDIO_LOCK = os.path.join(_SYNC_DIR, "chladni-audio.lock")
+_SYNC_FILE = os.path.join(_SYNC_DIR, "chladni-sync.json")
+_lock_fd = None
+
+
+def claim_audio():
+    """True for exactly one running instance: the one that plays sound.
+
+    Omarchy starts one screensaver per monitor. Every instance used to play its
+    own audio from its own random track, so two monitors meant two DIFFERENT
+    recitations over each other -- measured: Al-Mulk and Al-Qadr at once. An
+    exclusive, non-blocking flock held for the life of the process picks one
+    owner, and the kernel releases it however the owner exits.
+    """
+    global _lock_fd
+    try:
+        fd = os.open(_AUDIO_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    _lock_fd = fd                     # keep it open: closing it releases the lock
+    return True
+
+
+def publish_start(track, epoch):
+    """The owner tells the others which track it began and exactly when."""
+    tmp = _SYNC_FILE + ".%d" % os.getpid()
+    with open(tmp, "w") as fh:
+        json.dump({"pid": os.getpid(), "track": int(track), "epoch": float(epoch)}, fh)
+    os.replace(tmp, _SYNC_FILE)       # atomic, so a reader never sees half a file
+
+
+def await_start(since, timeout=8.0):
+    """A silent instance waits for the owner's start, then follows it.
+
+    Only accepts a record written by a process that is still alive and that
+    appeared after this instance started, so a stale file from an earlier
+    session cannot steer a new one. Returns None on timeout, and the instance
+    then runs on its own clock, silently -- a picture out of step beats no picture.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if os.path.getmtime(_SYNC_FILE) >= since - 1.0:
+                with open(_SYNC_FILE) as fh:
+                    rec = json.load(fh)
+                os.kill(int(rec["pid"]), 0)
+                return rec
+        except (OSError, ValueError, KeyError):
+            pass
+        time.sleep(0.05)
+    return None
+
+
 class Audio:
     """Play the recitation that is driving the figure, in step with it.
 
@@ -1356,6 +1411,7 @@ def synth_timeline(nm, fps=24.0, secs=90.0):
 
 
 def main():
+    launched_at = time.time()
     ap = argparse.ArgumentParser()
     ap.add_argument("--fps", type=float, default=0.0,
                     help="target frame rate (default: the monitor's refresh rate)")
@@ -1526,12 +1582,20 @@ def main():
     # The timeline is driven by the WALL CLOCK, not by a frame counter, so the
     # picture cannot drift away from the recitation playing beside it. A dropped
     # frame costs a frame, not sync.
-    audio = Audio(volume=args.volume, enabled=not args.silent)
+    owner = claim_audio()
+    audio = Audio(volume=args.volume, enabled=(not args.silent) and owner)
     cur_hue = None
     last_fig = -2
     ntracks = len(tl["meta"])
     track = int(np.clip(np.searchsorted(offs, gi, side="right") - 1, 0, ntracks - 1))
     track_started = time.time()
+    if owner:
+        publish_start(track, track_started)
+    else:
+        rec = await_start(launched_at)
+        if rec is not None:
+            track = int(rec["track"]) % ntracks
+            track_started = float(rec["epoch"])
     gap_until = 0.0
     audio.play(tl["meta"][track]["key"])
 
@@ -1546,9 +1610,13 @@ def main():
                 # A beat of quiet between reciters: the sand keeps settling on
                 # the last figure while the next voice is cued up.
                 if now >= gap_until:
+                    # The next track starts at a COMPUTED time, not at whatever
+                    # moment this loop noticed. Two instances noticing on
+                    # different frames would otherwise drift a frame apart per
+                    # track, and a screensaver runs for hours.
+                    track_started = gap_until
                     gap_until = 0.0
                     track = (track + 1) % ntracks
-                    track_started = time.time()
                     audio.play(tl["meta"][track]["key"])
                     continue
                 local = tframes - 1
@@ -1556,7 +1624,7 @@ def main():
                 local = int((now - track_started) * tfps)
                 if local >= tframes:
                     audio.stop()
-                    gap_until = now + max(0.0, args.gap)
+                    gap_until = track_started + tframes / tfps + max(0.0, args.gap)
                     local = tframes - 1
             gi = int(offs[track]) + min(local, tframes - 1)
             amps = tl["amps"][gi % total]

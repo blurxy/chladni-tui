@@ -8,7 +8,13 @@ if false; then
 fi
 
 # Exit early if screensaver is already running
-pgrep -f '[o]rg.omarchy.screensaver' && exit 0
+# Asked of the compositor, not the process table: `pgrep -f` matches any process
+# whose arguments merely CONTAIN this text -- a shell running a command that
+# mentions it, a grep through the journal -- and made this exit 0 with no
+# screensaver on screen. "Already running" means a window with this class exists.
+if hyprctl clients -j 2>/dev/null | jq -e 'any(.[]; .class == "org.omarchy.screensaver")' >/dev/null; then
+  exit 0
+fi
 
 # Allow screensaver to be turned off but also force started
 if omarchy-toggle-enabled screensaver-off && [[ $1 != "force" ]]; then
