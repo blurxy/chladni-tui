@@ -337,12 +337,24 @@ class FigurePlayer:
     the live selector was.
     """
 
-    def __init__(self, nm, fps, fade=1.0):
+    # FADE 0.35s, AND MEASURED IN REAL SECONDS. Two modes blended have zeros
+    # only where BOTH vanish, which is a set of POINTS -- so during a crossfade
+    # the sand beads into dots instead of drawing lines. That is fine for a moment
+    # and ruinous as a steady state, which is what it became: figures change
+    # every 1.08s (median), the fade was 1.0s, and it was counted in frames at
+    # the TARGET rate (240 on a 240Hz monitor) while the renderer ran at 115,
+    # stretching it to 2.1s real. Measured against the schedule, the plate showed
+    # a blend 75% of the time -- a live screen of scattered dots, which is exactly
+    # what "it doesn't look like the reel" was describing. At 0.35s of real time
+    # it is 19%.
+    def __init__(self, nm, fps, fade=0.35):
         self.nm = nm; self.fps = float(fps); self.fade = float(fade)
         self.cur = -1; self.prev = -1; self.left = 0.0; self.since = 0.0
 
-    def update_to(self, idx):
-        dt = 1.0 / self.fps
+    def update_to(self, idx, dt=None):
+        # dt from the caller's clock when there is one; a fixed step otherwise,
+        # which is what --dump wants when it settles a figure with no wall clock.
+        dt = (1.0 / self.fps) if dt is None else float(dt)
         self.since += dt
         idx = int(idx)
         if idx != self.cur:
@@ -600,13 +612,30 @@ class Screen:
         # solid stroke and a grain in transit leaves a short trail.
         # The density mapping below calibrates itself per frame, so this needs
         # no matching gain change: it measures whatever scale it is handed.
+        #
+        # THE MEMORY IS IN SECONDS, NOT FRAMES. "About 8 frames, a third of a
+        # second" was true at 24fps and nowhere else: at 115fps eight frames is
+        # 0.07s. The decay now uses the same clock-measured timestep as the
+        # physics (sand.dts, 1.0 at the reference rate), so a trail lasts a third
+        # of a second at any frame rate.
+        #
+        # AND A DOT IS LIT ONLY ABOVE A REAL THRESHOLD, not above zero. A float
+        # multiplied by 0.88 does not reach zero for hundreds of frames, so "> 0"
+        # lit every sub-dot any grain had crossed in the last ten-plus seconds.
+        # Replaying the real figure schedule headlessly: 20.7% of the canvas lit,
+        # 19.2% of it by history under one grain-visit -- a uniform haze of ghost
+        # dots from lines the sand had already left, which is what buried the live
+        # figure. --dump never showed it because it composes once from a fresh
+        # buffer. 0.35 lets a departed grain's trail fade within about a third of
+        # a second while a grain actually standing there (steady state ~8) stays lit.
+        decay = np.float32(0.88 ** float(getattr(sand, "dts", 1.0)))
         if self.accum is None or self.accum.shape != cnt.shape:
             self.accum = cnt.copy()
         else:
-            self.accum *= np.float32(0.88)
+            self.accum *= decay
             self.accum += cnt
         grid = self.accum.reshape(rows, 4, cols, 2)
-        code = ((grid > 0) * DOTW[None, :, None, :]).sum(axis=(1, 3)).astype(np.uint16)
+        code = ((grid >= 0.35) * DOTW[None, :, None, :]).sum(axis=(1, 3)).astype(np.uint16)
         dens = grid.sum(axis=(1, 3))
         # Spread a little of each cell's density into its neighbours. Without
         # this every cell holding sand saturates to the top of the ramp and the
@@ -1331,6 +1360,8 @@ def main():
     sand = Sand(ngrain, subw, subh, bank, fps=args.fps)
     sand.dts = Sand.REF_FPS / max(args.fps, 1.0)
     _last_step_t = 0.0
+    _sel_t = 0.0
+    was_fading = False
     gain = 1.0 / max(3.0, ngrain / float(cols * rows) * 4.5)
     chrome = Chrome(cols, rows)
     scr.set_underlay(plate_ring(bank, subw, subh), C["rule"])
@@ -1492,13 +1523,25 @@ def main():
             gi = int(offs[track]) + min(local, tframes - 1)
             amps = tl["amps"][gi % total]
             if tl.get("fig") is not None:
-                w = sel.update_to(tl["fig"][gi % total])
+                _fdt = min(0.25, now - _sel_t) if _sel_t else (1.0 / max(args.fps, 1.0))
+                _sel_t = now
+                w = sel.update_to(tl["fig"][gi % total], _fdt)
             else:
                 w = sel.update(amps, bank.select)
             E, GX, GY = bank.field_w(w)
-            if sel.cur != last_fig:
+            # REDRAW THE WASH THROUGH THE WHOLE CROSSFADE, AND ONCE AS IT ENDS.
+            # set_field_bg's docstring always said it was recomputed "during a
+            # cross-fade"; this call site only fired when sel.cur changed, which is
+            # the FIRST frame of the fade, when E is still almost entirely the
+            # outgoing figure. So the wash froze on the previous figure and the new
+            # figure's nodal lines were drawn across its bright antinodes. Measured
+            # under sand sitting on the current lines: mean wash level 0.47 as set,
+            # against 0.03 from the current field.
+            fading = float(getattr(sel, "left", 0.0)) > 0.0
+            if sel.cur != last_fig or fading or was_fading:
                 last_fig = sel.cur
                 scr.set_field_bg(E, bank)
+            was_fading = fading
             # Loudness drives how hard the plate is hit; the spectrum decides
             # which modes. Keeping them separate stops quiet passages freezing
             # the sand and loud ones blowing the figure apart.
