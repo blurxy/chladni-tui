@@ -704,8 +704,18 @@ class Screen:
             ref = float(np.percentile(lit, 99.0))
             self.dref = ref if self.dref is None else self.dref * 0.88 + ref * 0.12
         ref = max(12.0, self.dref if self.dref else 12.0)
-        a = 12.0 / ref
-        norm = np.log1p(np.maximum(dens, 0.0) * a) / math.log1p(12.0)
+        # THE CURVE, not the reference. Live, a cell on a nodal line averaged level
+        # 5.6 of 13 -- the teal/gold boundary -- so figures read cold next to the
+        # settled --dump stills. Measured over 15s of real playback, three ways of
+        # moving the REFERENCE all made lines DIMMER (5.8, 5.5 against 5.6), because
+        # the faint cells they excluded were holding the percentile down. Widening
+        # the log's span and easing the curve raises the middle without spending the
+        # top: line cells 5.6 -> 7.2, lit cells in the warm half 12.5% -> 22.0%, and
+        # pure white unchanged at 2.6%, so white still means a crossing rather than
+        # "bright". A lower percentile reached 8.9 but put 11% of lit cells on white.
+        K = 40.0
+        a = K / ref
+        norm = (np.log1p(np.maximum(dens, 0.0) * a) / math.log1p(K)) ** 0.8
         np.clip(norm, 0.0, 1.0, out=norm)
         lv = (norm * (NLEV - 1) + 0.5).astype(np.uint8)
         if self.under is not None:
