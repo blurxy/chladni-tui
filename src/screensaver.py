@@ -162,11 +162,15 @@ BG0 = NLEV + len(CK)
 # "dots" draws the same field in braille instead, at the sand's own
 # resolution, which cannot band; it costs a glyph in cells that were empty.
 MEMBRANE = {"off": 0.0, "soft": 0.35, "full": 1.0, "dots": 1.0}
-# Below this width "dots" falls back to the wash. The braille threshold is an
-# 8x8 Bayer tile over SUB-DOTS, which is 4 cells wide -- at 165 columns that is
-# 2.4% of the screen and the antinodes render as square patches of the DITHER
-# rather than of the field. Measured: invisible at 280 columns, obvious at 165.
-DOTS_MIN_COLS = 200
+# Below this width "dots" falls back to the wash: the 8x8 Bayer tile is 4 cells
+# across, and on a narrow plate that is a coarse blotch rather than a texture.
+# Found by RENDERING 165/180/220/260/280 and looking, after two analytic proxies
+# disagreed with each other and with the images -- a tile-size-over-plate-width
+# ratio called every width "visible", and an FFT of the dot-count map ran
+# backwards, rising with width because more periods fit. Both measured something
+# real; neither measured whether you can see it. 165 shows square patches, 180
+# and up read as an even stipple, so the boundary sits between them.
+DOTS_MIN_COLS = 180
 
 
 def build_lut(hue_shift=0.0):
