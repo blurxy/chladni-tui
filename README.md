@@ -4,14 +4,15 @@
 
 ![the plate](docs/screensaver.png)
 
-<sub>Husary reciting Ya-Sin 36:14. The figure is (1,3) — one nodal diameter and two
-interior rings, at 0.377 and 0.690 of the radius where J₁'s zeros put them. Its
-frequency is **550 Hz**; the peak in the voice at that moment is **551 Hz**. That is
-one well-chosen frame: across the whole library the correlation between recited
-pitch and the figure shown is a median of 0.50 per track. Rendered headlessly by
+<sub>Abdul Basit reciting At-Takaathur 102:4. The figure is (1,4) — one nodal
+diameter, so two spokes, and three interior rings where J₁'s zeros put them.
+Across the whole library the correlation between recited pitch and the figure
+shown is a median of 0.50 per track. Rendered headlessly by
 `tools/render-dump.py`, so it carries no desktop — and note what `--dump` is: it
 holds one figure for 700 physics steps before drawing, so this is a fully settled
-figure. Live, figures change about once a second and their lines render dimmer.</sub>
+figure. Live, a figure holds for 6 s by default and its lines render dimmer. The
+plate sits right of centre on purpose: a radially symmetric object centred in a
+rectangle doubles the symmetry and reads as a specimen in a display case.</sub>
 
 Sand on a vibrating plate collects wherever the plate is still. This simulates
 that — 45,000 to 300,000 grains depending on plate size, on a clamped circular
@@ -54,9 +55,85 @@ measured: all 1,438 transitions fire 0.46s early against the same schedule
           with no lead (0.45s, snapped to whole frames at 24 fps)
 ```
 
+## The complaint that took three wrong answers
+
+> *"regardless of which audio is being put here, everything still looks the same"*
+
+Read as a **fidelity** problem, it produces a rendering fix. Read as a **vocabulary**
+problem, it produces more modes. Both are wrong, and the histogram says so in one
+pass over all 38 tracks:
+
+```
+hold   changes/min   figures/track   tracks distinguishable
+ 0.0          60.1      18.5 of 20                    0.39
+ 1.5          38.4            16.0                    0.45
+ 3.0          19.5            13.0                    0.58
+ 6.0          10.1             8.0                    0.69
+10.0           6.1             6.0                    0.78
+```
+
+*distinguishable* is the mean pairwise total-variation distance between each track's
+figure histogram; 0 means every recitation shows the same mix.
+
+All 20 figures were already in use, and near-uniformly — the vocabulary was never
+short. The plate changed figure **once a second** and ran through **18.5 of the 20
+figures inside a single track**, so every recitation averaged out to the same soup.
+The complaint was caused by too *much* change, not too little, which is exactly why
+every attempt to make each individual frame better left the whole thing looking
+identical. A floor on how often the picture may change costs nothing in sync — the
+next change the schedule asks for is simply the one taken.
+
 ## Things that were wrong, and how they were found
 
 Most of the work here was measurement, not cleverness.
+
+**The membrane was drawn at an eighth of the sand's resolution.** A cell
+background is one colour for a 2×4 block of sub-dots, so however finely the
+driving field is computed the wash is quantised to that — at a real window size
+the plate rendered as a mosaic of rectangles with the physics lost underneath.
+It now draws in braille at the sand's own resolution, thresholded per sub-dot
+against an 8×8 Bayer matrix tiled over the **sub-dot** grid rather than the cell
+grid, so the pattern cannot realign into the blocks it exists to avoid. Measured
+over 240 frames: **6,267 bytes/frame against the wash's 8,379** — a held figure's
+membrane does not change, so the frame diff skips it, while a background run is
+broken up by every sand cell on its row.
+
+**Two instruments disagreed about when that dither becomes visible, and both were
+wrong.** A tile-width-over-plate-width ratio called every width visible, including
+387 columns. An FFT of the per-cell dot-count map ran *backwards* — power at the
+4-cell period rises from 1.5× to 6.6× between 140 and 387 columns, because more
+periods fit and the peak sharpens. Both measured something real; neither measured
+whether you can see it. Rendering 165/180/220/260/280 and looking settled it in one
+pass: square patches at 165, even stipple from 180 up.
+
+**Off-centring the plate exposed a bug that symmetry had been hiding.** `ModeBank`
+published `self.cxp` as the middle of the raster while building the field around
+`cx`. `cxp` is the plate's centre for everything downstream — the rim ring,
+escaped-grain reinjection, the resize remap — so the ring orbited a point the plate
+was no longer at and recycled grains were thrown into open space. Centred, the two
+values agreed and the defect was invisible.
+
+**The layout changed depending on which verse was playing.** The band under the
+plate derived its top edge from the wrapped line count of the current ayah while
+the plate's size came from a constant, so a long verse grew the text upward into
+the picture and a short one did not. `tools/layout-check.py` now draws all 760
+verses in the library, plus four degenerate shapes a track can legitimately have
+(no text, transliteration only, and one past the wrap limit on both lines),
+across 7 terminal sizes and 3 panel modes — **16,044 frames, about a second, no
+audio and no terminal** — and asserts the ayah header lands on the same row every
+time, the plate never reaches it, and nothing writes into the bottom strip.
+
+The first thing that harness caught was a number in this README. `764` above was
+`760 + 4`: the real verses plus the synthetic edge cases, quoted as though they
+were all real. It had been written an hour earlier, in this section, about
+measurement.
+
+**Three crashes shared one root cause.** `keyboard(True)` ran ~180 lines above the
+`try/finally` that undid it, so `--dump`, a corrupt `timeline.npz`, and a track
+with no translation each crashed *and* left the terminal in cbreak — a broken
+shell on the way out. A missing timeline was always handled; a damaged one was
+not. Restoration is now registered with `atexit`, which covers every exit path
+rather than the one that happened to be inside the block.
 
 **The palette never appeared.** Settled sand is bimodal — cells on a nodal line
 held a median of 58 grains and up to 1055; every other cell held none. The linear

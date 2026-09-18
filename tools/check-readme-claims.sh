@@ -51,5 +51,54 @@ for s in bin/* tools/* install.sh; do [ -f "$s" ] || continue
   bash -n "$s" 2>/dev/null || { echo "$s does not parse" >&2; fail=1; }
 done
 
+# NUMBERS DECAY SILENTLY. A path that stops existing is caught above; a figure
+# that stops being true is not, because nothing about "16,044 frames" looks
+# wrong once it is 12,988. Every number below is recomputed from its SOURCE and
+# the README must still contain it. Only claims with a reproducible source
+# belong here -- prose and screenshots are still on the author.
+# Matched against a whitespace-flattened copy: README prose wraps, so "760
+# verses" is routinely split across two lines and a literal grep reports a stale
+# number that is merely hyphenated by the margin.
+README_FLAT=$(tr "\n" " " < README.md | tr -s " ")
+claim() {  # claim <what> <expected> [alt]
+  local what="$1" want="$2" alt="${3:-}"
+  if [[ $README_FLAT == *"$want"* ]] || { [ -n "$alt" ] && [[ $README_FLAT == *"$alt"* ]]; }; then
+    return 0
+  fi
+  echo "README no longer states $what -- it is now $want" >&2
+  fail=1
+}
+
+PY_BIN=${PY_BIN:-$HOME/.local/share/cymatics/.venv/bin/python}
+if [ -x "$PY_BIN" ]; then
+  # library scale, straight out of the timeline the screensaver reads
+  eval "$("$PY_BIN" - <<'EOF' 2>/dev/null
+import json, os, numpy as np
+tl = os.path.expanduser("~/.local/share/omarchy-cymatics-screensaver/timeline.npz")
+if os.path.exists(tl):
+    z = np.load(tl, allow_pickle=False)
+    m = json.loads(str(z["meta"])); t = m["tracks"] if isinstance(m, dict) else m
+    ayat = sum(len(x.get("text") or []) for x in t)
+    print("N_TRACKS=%d" % len(t))
+    print("N_MODES=%d" % z["mn"].shape[0])
+    print("N_AYAT=%d" % ayat)
+EOF
+)"
+  [ -n "${N_MODES:-}" ] && claim "the mode count" "$N_MODES modes" "${N_MODES} of ${N_MODES}"
+  [ -n "${N_AYAT:-}" ]  && claim "the verse count" "$N_AYAT verses" "all $N_AYAT verses"
+  [ -n "${N_TRACKS:-}" ] && claim "the track count" "$N_TRACKS tracks"
+
+  # the invariant harness reports its own frame count; the README quotes it
+  LC=$("$PY_BIN" tools/layout-check.py 2>/dev/null | grep -oE '^layout-check: [0-9]+' | grep -oE '[0-9]+')
+  if [ -n "$LC" ]; then
+    printf -v LCC "%'d" "$LC" 2>/dev/null || LCC=$LC
+    claim "the layout-check frame count" "$LCC frames" "$LC frames"
+  fi
+fi
+
+# constants the README quotes by value
+DMC=$(grep -oE '^DOTS_MIN_COLS = [0-9]+' src/screensaver.py | grep -oE '[0-9]+')
+[ -n "$DMC" ] && claim "the dither threshold" "$DMC up" "$DMC columns"
+
 ((fail)) && { echo "FAIL: the README claims something this repo does not have" >&2; exit 1; }
 echo "ok: README claims check out ($(echo "$claimed" | wc -w) flags, all referenced paths and images)"
